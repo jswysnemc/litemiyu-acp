@@ -322,9 +322,8 @@ impl WindowsPasteState {
                 && (pk == PasteKey::Enter
                     || has_more_queued_keys
                     || self.burst.should_protect_control(now))
-            {
-                if let Some(clip) = read_clipboard() {
-                    if let Some((prefix_bytes, full_text)) =
+                && let Some(clip) = read_clipboard()
+                    && let Some((prefix_bytes, full_text)) =
                         self.begin_multiline_from_text(text_before_cursor, &clip, pk, now)
                     {
                         return WindowsPasteOutcome::ReplacePrefixWithPaste {
@@ -332,8 +331,6 @@ impl WindowsPasteState {
                             full_text,
                         };
                     }
-                }
-            }
 
             // 剪贴板未命中（或首行为空 / 剪贴板不可用），但处于突发输入或队列紧跟后续按键：插入换行而非提交！
             if has_more_queued_keys || self.burst.consume_control(now) {

@@ -38,15 +38,15 @@ pub fn copy_text(text: &str) {
     }
 }
 
+/// 剪贴板截图落盘缓存最多保留的近期文件数，防止长期使用无限累积。
+const MAX_CACHED_CLIPS: usize = 50;
+
 pub fn open_target(target: &str) {
-    let cleaned = target
-        .strip_prefix("file:///")
-        .or_else(|| target.strip_prefix("file://"))
-        .unwrap_or(target);
+    let cleaned = decode_file_uri_to_path(target);
     #[cfg(windows)]
     {
         let _ = Command::new("cmd")
-            .args(["/C", "start", "", cleaned])
+            .args(["/C", "start", "", &cleaned])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -55,7 +55,7 @@ pub fn open_target(target: &str) {
     #[cfg(target_os = "macos")]
     {
         let mut cmd = Command::new("open");
-        cmd.arg(cleaned)
+        cmd.arg(&cleaned)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -67,7 +67,7 @@ pub fn open_target(target: &str) {
         // 1. 必须通过 setsid 脱离控制终端 /dev/tty，防止默认关联为终端编辑器（如 helix/vim）时
         //    后台子进程打开 /dev/tty 与前端 TUI 争抢键盘和鼠标输入流
         let mut cmd = Command::new("xdg-open");
-        cmd.arg(cleaned)
+        cmd.arg(&cleaned)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -344,7 +344,42 @@ fn save_clip_image(bytes: &[u8], ext: &str) -> Option<PathBuf> {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let path = dir.join(format!("clip_{ts}_{seq}.{ext}"));
     std::fs::write(&path, bytes).ok()?;
+    prune_clip_cache(&dir, MAX_CACHED_CLIPS);
     Some(path)
+}
+
+/// 清理剪贴板图片缓存目录中超出上限的历史文件，仅保留最近的 `max_keep` 份。
+///
+/// 参数:
+/// - `dir`: 缓存目录路径
+/// - `max_keep`: 允许保留的最大文件数量
+fn prune_clip_cache(dir: &Path, max_keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, String, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("clip_") {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            Some((mtime, name, entry.path()))
+        })
+        .collect();
+    if files.len() <= max_keep {
+        return;
+    }
+    // 1. 按修改时间与文件名从新到旧排序，保留前 max_keep 个，移除其余旧缓存
+    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    for (_, _, old_path) in files.into_iter().skip(max_keep) {
+        let _ = std::fs::remove_file(old_path);
+    }
 }
 
 /// 将 24-bit / 32-bit 无压缩（BI_RGB / BI_BITFIELDS）BMP 字节转为标准 PNG。
@@ -378,7 +413,7 @@ pub fn bmp_to_png(bmp: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     let bytes_per_pixel = (bit_count / 8) as usize;
-    let row_stride = ((width as usize * bytes_per_pixel + 3) / 4) * 4;
+    let row_stride = (width as usize * bytes_per_pixel).div_ceil(4) * 4;
     let needed = pixel_offset
         .checked_add(row_stride.saturating_mul(height as usize))
         .ok_or_else(|| "BMP 大小溢出".to_string())?;
@@ -499,7 +534,7 @@ mod tests {
         bmp[22..26].copy_from_slice(&2i32.to_le_bytes());
         bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
         bmp[28..30].copy_from_slice(&32u16.to_le_bytes());
-        for px in bmp[54..].chunks_exact_mut(4) {
+        for px in bmp[54..].as_chunks_mut::<4>().0 {
             px[0] = 0x10; // B
             px[1] = 0x20; // G
             px[2] = 0xf0; // R
@@ -532,5 +567,35 @@ mod tests {
     fn decodes_unix_file_uri_with_leading_slash_and_percent_encoding() {
         let path = super::decode_file_uri_to_path("file:///home/snemc/%E5%9B%BE%E7%89%87%201.png");
         assert_eq!(path, "/home/snemc/图片 1.png");
+    }
+
+    #[test]
+    fn prunes_clip_cache_to_max_keep_and_preserves_other_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "litemiyu_clip_prune_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("clip_20260101_00000{i}_{i}.png")), b"x")
+                .expect("write clip");
+        }
+        std::fs::write(dir.join("notes.txt"), b"keep").expect("write other file");
+
+        super::prune_clip_cache(&dir, 2);
+
+        let mut remaining: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        remaining.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            remaining.iter().filter(|n| n.starts_with("clip_")).count(),
+            2
+        );
+        assert!(remaining.contains(&"notes.txt".to_string()));
     }
 }

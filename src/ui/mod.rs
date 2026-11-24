@@ -1,9 +1,14 @@
 //! 主 TUI 渲染协调器（复刻 LiteMiyu 首页 + 对话双栏视图 + 流光状态行 + 圆角输入框 + 极简底栏）。
 
 pub mod activity;
+pub mod format;
+mod input_box;
 pub mod overlay;
 pub mod rows;
+pub mod selection;
 pub mod sidebar;
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -12,12 +17,13 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::acp::{PermissionRequest, SessionSummary};
 use crate::background::BackgroundTask;
-use crate::input::{AtomKind, AtomSpan, InputEditor};
+use crate::completion::CompletionMenu;
+use crate::input::InputEditor;
 use crate::linebreak;
 use crate::theme;
 use crate::transcript::{Transcript, format_short};
@@ -32,9 +38,15 @@ pub fn input_text_width(box_w: u16) -> u16 {
     box_w.saturating_sub(6).max(1)
 }
 
-use overlay::{PickerState, SlashSuggestion};
+use overlay::PickerState;
 use rows::{MdCache, RenderRow, RowCopyMeta, build_body, row_to_line};
+use input_box::{draw_input_box, draw_pulse_line, draw_scrollbar};
+use selection::{ScreenSnapshot, apply_selection_highlight};
+pub use selection::TextSelection;
 use sidebar::{SidebarData, SidebarHits};
+
+/// 正文单行命中热区元信息（屏幕行、条目 ID、是否可折叠、行内链接列表）。
+pub type BodyRowHit = (u16, u64, bool, Vec<(u16, u16, String)>);
 
 /// 紧凑可交互组件的鼠标悬停目标（不含正文大块与折叠区，避免大面积闪烁）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,44 +66,6 @@ pub enum HoverTarget {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct TextSelection {
-    pub anchor: (u16, u16),
-    pub head: (u16, u16),
-    /// 限制选区的列边界（避免在正文区拖选时误框入右侧边栏或滚动条）
-    pub zone: Rect,
-}
-
-impl TextSelection {
-    /// 返回规范化后的 `(start, end)`，按 `(row, col)` 从小到大排序。
-    pub fn ordered(&self) -> ((u16, u16), (u16, u16)) {
-        let a = (self.anchor.1, self.anchor.0);
-        let b = (self.head.1, self.head.0);
-        if a <= b {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
-    }
-
-    pub fn row_col_range(&self, y: u16) -> Option<(u16, u16)> {
-        let ((sx, sy), (ex, ey)) = self.ordered();
-        if y < sy
-            || y > ey
-            || self.zone.width == 0
-            || self.zone.height == 0
-            || y < self.zone.y
-            || y >= self.zone.bottom()
-        {
-            return None;
-        }
-        let z_left = self.zone.x;
-        let z_right = self.zone.right().saturating_sub(1);
-        let from = if y == sy { sx.clamp(z_left, z_right) } else { z_left };
-        let to = if y == ey { ex.clamp(z_left, z_right) } else { z_right };
-        (from <= to).then_some((from, to))
-    }
-}
 
 #[derive(Default, Debug, Clone)]
 pub struct FrameHits {
@@ -117,88 +91,27 @@ pub struct FrameHits {
     /// 当前输入框文字区净列宽（供多行上下键光标移动与折行严格对齐）
     pub input_text_width: u16,
     pub sidebar: SidebarHits,
-    pub body_rows: Vec<(u16, u64, bool, Vec<(u16, u16, String)>)>,
+    pub body_rows: Vec<BodyRowHit>,
     pub total_body_rows: usize,
     pub visible_body_rows: usize,
     pub entry_starts: HashMap<u64, usize>,
     /// 正文各屏幕行的复制元信息（跳过代码块语言头/左侧装饰列，自动拼接软折行）
     pub row_copy_meta: HashMap<u16, RowCopyMeta>,
-    /// 本帧完整屏幕网格（按行存 `(col, symbol)`），用于 100% 所见即所得精准划词复制
-    pub screen_lines: Vec<Vec<(u16, String)>>,
+    /// 本帧扁平屏幕纯文本快照（整屏仅 3 次连续分配），用于所见即所得划词复制
+    pub screen_snapshot: ScreenSnapshot,
 }
 
 impl FrameHits {
     /// 从当前帧快照中提取选区文字（跳过装饰列/语言标签行/右侧滚动条与边栏竖线、自动拼接软折行、不跨栏、去掉行尾补齐空格）。
     pub fn extract_selection(&self, sel: TextSelection) -> String {
-        let ((_, sy), (_, ey)) = sel.ordered();
-        let multi_row = sy < ey;
-        let in_body = self.body_text.width > 0 && sel.zone == self.body_text;
-        let mut lines: Vec<String> = Vec::new();
-        let mut prev_emitted_y: Option<u16> = None;
-
-        for y in sy..=ey {
-            let Some((raw_from, to)) = sel.row_col_range(y) else {
-                continue;
-            };
-            let meta = if in_body {
-                self.row_copy_meta.get(&y).copied()
-            } else {
-                None
-            };
-            // 多行框选时自动跳过代码块语言标签、空竖线等纯装饰行
-            if multi_row && meta.is_some_and(|m| m.decorative) {
-                continue;
-            }
-            let from = if let Some(m) = meta {
-                raw_from.max(self.body_text.x.saturating_add(m.content_left))
-            } else {
-                raw_from
-            };
-            if from > to {
-                continue;
-            }
-            let Some(cells) = self.screen_lines.get(usize::from(y)) else {
-                continue;
-            };
-            let mut line = String::new();
-            let mut skip_until = 0u16;
-            for (x, sym) in cells {
-                if *x < skip_until {
-                    continue;
-                }
-                let w = u16::try_from(sym.width()).unwrap_or(1).max(1);
-                if *x + w > from && *x <= to {
-                    // 兜底过滤正文右侧滚动条（┃/│）与侧边栏分隔竖线（│），绝不带入剪贴板
-                    let is_right_chrome = (self.scrollbar_col == Some(*x)
-                        && matches!(sym.as_str(), "┃" | "│"))
-                        || (self.sidebar_divider_col == Some(*x) && sym.as_str() == "│");
-                    if !is_right_chrome {
-                        line.push_str(sym);
-                    }
-                }
-                skip_until = *x + w;
-            }
-            let trimmed = line.trim_end().to_string();
-            if meta.is_some_and(|m| m.join_previous)
-                && prev_emitted_y == Some(y.saturating_sub(1))
-                && !lines.is_empty()
-            {
-                if let Some(last) = lines.last_mut() {
-                    last.push_str(&trimmed);
-                }
-            } else {
-                lines.push(trimmed);
-            }
-            prev_emitted_y = Some(y);
-        }
-        // 去掉首尾全空行（保留中间有意义的空行）
-        while lines.first().is_some_and(|l| l.is_empty()) {
-            lines.remove(0);
-        }
-        while lines.last().is_some_and(|l| l.is_empty()) {
-            lines.pop();
-        }
-        lines.join("\n")
+        selection::extract_selection(
+            &self.screen_snapshot,
+            sel,
+            self.body_text,
+            self.scrollbar_col,
+            self.sidebar_divider_col,
+            &self.row_copy_meta,
+        )
     }
 }
 
@@ -221,8 +134,8 @@ pub struct ViewState<'a> {
     pub toast: Option<(&'a str, bool)>,
     pub background_tasks: &'a [BackgroundTask],
     pub recent_sessions: &'a [SessionSummary],
-    pub slash_menu: &'a [SlashSuggestion],
-    pub slash_selected: usize,
+    pub completion_menu: Option<&'a CompletionMenu>,
+    pub completion_selected: usize,
     pub pending_images: usize,
     pub selection: Option<TextSelection>,
     pub hover: &'a HoverTarget,
@@ -284,8 +197,7 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         let max_inner = main_area
             .height
             .saturating_sub(9)
-            .min(CHAT_INPUT_MAX_ROWS)
-            .max(1);
+            .clamp(1, CHAT_INPUT_MAX_ROWS);
         let inner_rows = (vlines.len() as u16).clamp(1, max_inner);
         let box_h = inner_rows + 2;
         let y = footer_y.saturating_sub(box_h);
@@ -429,22 +341,25 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         SidebarHits::default()
     };
 
-    // 6. 斜杠命令悬浮菜单 & 模态选择器
-    if view.permission.is_none() && view.picker.is_none() && !view.slash_menu.is_empty() {
-        overlay::draw_slash_menu(frame, box_area, view.slash_menu, view.slash_selected);
+    // 6. 统一输入补全悬浮菜单（/ 命令 · # Skills · @ 文件） & 模态选择器
+    if view.permission.is_none()
+        && view.picker.is_none()
+        && let Some(menu) = view.completion_menu
+    {
+        overlay::draw_completion_menu(frame, box_area, menu, view.completion_selected);
     }
     if let Some(picker) = view.picker {
         overlay::draw_picker(frame, full, picker);
     }
 
-    // 先抓一份本帧纯文本网格，再给选区叠加反色高亮（确保选区与屏幕文字 100% 一致）
+    // 抓取扁平屏幕纯文本快照（整屏单块连续内存），再叠加选区反色高亮
     let body_text = Rect::new(
         body_area.x,
         body_area.y,
         text_room.min(body_area.width.saturating_sub(2).max(1)),
         body_area.height,
     );
-    let screen_lines = snapshot_buffer(frame.buffer_mut(), full);
+    let screen_snapshot = ScreenSnapshot::capture(frame.buffer_mut(), full);
     // 仅对紧凑行内链接叠加悬停下划线与微底色（不作用于正文大块或折叠行）
     if let HoverTarget::BodyLink {
         row,
@@ -489,19 +404,18 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         visible_body_rows: visible_rows,
         entry_starts: built.entry_starts,
         row_copy_meta,
-        screen_lines,
+        screen_snapshot,
     }
 }
 
 /// 极简居中启动首页（复刻 LiteMiyu `tui-new.webp`）。
 fn draw_home(frame: &mut Frame, full: Rect, view: &ViewState<'_>) -> FrameHits {
-    let box_w = full.width.saturating_sub(6).min(80).max(28);
+    let box_w = full.width.saturating_sub(6).clamp(28, 80);
     let text_w = input_text_width(box_w);
     let max_inner = full
         .height
         .saturating_sub(10)
-        .min(HOME_INPUT_MAX_ROWS)
-        .max(1);
+        .clamp(1, HOME_INPUT_MAX_ROWS);
     let inner_rows = (view.editor.visual_lines(text_w).len() as u16).clamp(1, max_inner);
     let box_h = inner_rows + 2;
 
@@ -580,14 +494,17 @@ fn draw_home(frame: &mut Frame, full: Rect, view: &ViewState<'_>) -> FrameHits {
         );
     }
 
-    if view.permission.is_none() && view.picker.is_none() && !view.slash_menu.is_empty() {
-        overlay::draw_slash_menu(frame, box_area, view.slash_menu, view.slash_selected);
+    if view.permission.is_none()
+        && view.picker.is_none()
+        && let Some(menu) = view.completion_menu
+    {
+        overlay::draw_completion_menu(frame, box_area, menu, view.completion_selected);
     }
     if let Some(picker) = view.picker {
         overlay::draw_picker(frame, full, picker);
     }
 
-    let screen_lines = snapshot_buffer(frame.buffer_mut(), full);
+    let screen_snapshot = ScreenSnapshot::capture(frame.buffer_mut(), full);
     let empty_meta = HashMap::new();
     if let Some(sel) = view.selection {
         apply_selection_highlight(frame.buffer_mut(), full, sel, Rect::default(), &empty_meta);
@@ -599,399 +516,9 @@ fn draw_home(frame: &mut Frame, full: Rect, view: &ViewState<'_>) -> FrameHits {
         input_area: box_area,
         input_text_area,
         input_text_width: text_w,
-        screen_lines,
+        screen_snapshot,
         ..FrameHits::default()
     }
-}
-
-fn snapshot_buffer(buf: &ratatui::buffer::Buffer, area: Rect) -> Vec<Vec<(u16, String)>> {
-    let mut rows = Vec::with_capacity(usize::from(area.bottom()));
-    for y in 0..area.bottom() {
-        let mut line = Vec::with_capacity(usize::from(area.width));
-        if y >= area.y {
-            for x in area.x..area.right() {
-                line.push((x, buf[(x, y)].symbol().to_string()));
-            }
-        }
-        rows.push(line);
-    }
-    rows
-}
-
-fn apply_selection_highlight(
-    buf: &mut ratatui::buffer::Buffer,
-    full: Rect,
-    sel: TextSelection,
-    body_text: Rect,
-    row_copy_meta: &HashMap<u16, RowCopyMeta>,
-) {
-    let ((_, sy), (_, ey)) = sel.ordered();
-    let multi_row = sy < ey;
-    let in_body = body_text.width > 0 && sel.zone == body_text;
-    let max_y = full.bottom().saturating_sub(1);
-    for y in sy.max(full.y)..=ey.min(max_y) {
-        let meta = if in_body {
-            row_copy_meta.get(&y).copied()
-        } else {
-            None
-        };
-        if multi_row && meta.is_some_and(|m| m.decorative) {
-            continue;
-        }
-        if let Some((raw_from, to)) = sel.row_col_range(y) {
-            let from = if let Some(m) = meta {
-                raw_from.max(body_text.x.saturating_add(m.content_left))
-            } else {
-                raw_from
-            };
-            if from <= to {
-                let rect =
-                    Rect::new(from, y, to.saturating_sub(from) + 1, 1).intersection(full);
-                buf.set_style(rect, Style::new().add_modifier(Modifier::REVERSED));
-            }
-        }
-    }
-}
-
-fn draw_input_box(
-    frame: &mut Frame,
-    area: Rect,
-    editor: &InputEditor,
-    show_cursor: bool,
-    is_home: bool,
-    pending_images: usize,
-) -> Rect {
-    let text_w = input_text_width(area.width);
-    let visible_h = usize::from(area.height.saturating_sub(2));
-    let vlines = if editor.is_empty() {
-        Vec::new()
-    } else {
-        editor.visual_lines(text_w)
-    };
-    let (cur_row, cur_col) = if editor.is_empty() {
-        (0, 0)
-    } else {
-        editor.cursor_visual(text_w)
-    };
-    let total_lines = vlines.len();
-    let overflowing = total_lines > visible_h && visible_h > 0;
-
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme::faint());
-    if overflowing {
-        block = block.title_top(
-            Line::styled(
-                format!(" 第 {}/{total_lines} 行 ", cur_row + 1),
-                theme::dim(),
-            )
-            .left_aligned(),
-        );
-    }
-    if pending_images > 0 {
-        block = block.title_top(
-            Line::styled(
-                format!(" 已附 {pending_images} 张图片 "),
-                theme::md_image(),
-            )
-            .right_aligned(),
-        );
-    }
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.width < 4 || inner.height == 0 {
-        return Rect::default();
-    }
-
-    // 左侧提示符 `❯ `
-    frame.render_widget(
-        Paragraph::new(Line::styled(" ❯ ", theme::accent_bold())),
-        Rect::new(inner.x, inner.y, 3, 1),
-    );
-
-    let text_area = Rect::new(
-        inner.x + 3,
-        inner.y,
-        inner.width.saturating_sub(4).max(1),
-        inner.height,
-    );
-
-    if editor.is_empty() {
-        let placeholder = if is_home {
-            "/ 打开命令列表 · Ctrl+V/Alt+V 粘贴截图 · 拖拽图片直传"
-        } else {
-            "/ 命令 · Ctrl+V/Alt+V 贴图 · Shift+Enter 换行 · Ctrl+O 展开细节"
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    linebreak::clip(placeholder, text_area.width.saturating_sub(1)),
-                    theme::faint(),
-                ),
-            ])),
-            text_area,
-        );
-        if show_cursor {
-            frame.set_cursor_position((text_area.x, text_area.y));
-        }
-        return text_area;
-    }
-
-    let scroll = if total_lines <= visible_h {
-        0
-    } else {
-        cur_row
-            .saturating_sub(visible_h / 2)
-            .min(total_lines.saturating_sub(visible_h))
-    };
-
-    let text = editor.text();
-    let atoms = editor.atom_spans();
-    let p = theme::palette();
-    let image_chip_style = theme::md_image().bg(p.surface);
-    let paste_chip_style = theme::accent().bg(p.surface);
-    let lines: Vec<Line<'static>> = vlines
-        .iter()
-        .skip(scroll)
-        .take(visible_h)
-        .map(|vl| {
-            style_input_line(
-                text,
-                vl.start,
-                vl.end,
-                &atoms,
-                image_chip_style,
-                paste_chip_style,
-            )
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), text_area);
-
-    // 超过最大可见行数时，在输入框右侧留白列绘制迷你滚动条提示内部滚动位置
-    if overflowing && inner.width >= 5 {
-        let bar_x = inner.right().saturating_sub(1);
-        draw_scrollbar(
-            frame,
-            Rect::new(bar_x, inner.y, 1, inner.height),
-            total_lines,
-            visible_h,
-            scroll,
-        );
-    }
-
-    if show_cursor {
-        let cy = text_area.y + (cur_row.saturating_sub(scroll)) as u16;
-        let cx = text_area.x + cur_col.min(text_area.width.saturating_sub(1));
-        if cy < text_area.bottom() {
-            frame.set_cursor_position((cx, cy));
-        }
-    }
-    text_area
-}
-
-fn style_input_line(
-    full_text: &str,
-    line_start: usize,
-    line_end: usize,
-    atoms: &[AtomSpan],
-    image_chip_style: Style,
-    paste_chip_style: Style,
-) -> Line<'static> {
-    let mut spans = Vec::new();
-    let mut pos = line_start;
-
-    for atom in atoms {
-        if atom.end <= line_start {
-            continue;
-        }
-        if atom.start >= line_end {
-            break;
-        }
-        let seg_start = atom.start.max(line_start);
-        let seg_end = atom.end.min(line_end);
-        if seg_start > pos {
-            let plain = full_text[pos..seg_start].replace('\t', "    ");
-            spans.push(Span::styled(plain, theme::text()));
-        }
-        let chip_style = match atom.kind {
-            AtomKind::Image => image_chip_style,
-            AtomKind::PastedText => paste_chip_style,
-        };
-        let chip_text = full_text[seg_start..seg_end].replace('\t', "    ");
-        spans.push(Span::styled(chip_text, chip_style));
-        pos = seg_end;
-    }
-
-    if pos < line_end {
-        let tail = full_text[pos..line_end].replace('\t', "    ");
-        spans.push(Span::styled(tail, theme::text()));
-    }
-    if spans.is_empty() {
-        spans.push(Span::raw(String::new()));
-    }
-    Line::from(spans)
-}
-
-fn draw_pulse_line(
-    frame: &mut Frame,
-    area: Rect,
-    view: &ViewState<'_>,
-    scrolled_up: bool,
-) -> Rect {
-    if view.connecting {
-        let anim_frame = activity::frame_at(view.started_at.elapsed());
-        frame.render_widget(
-            Paragraph::new(activity::render_status_line(
-                "正在初始化 ACP 会话…",
-                "",
-                anim_frame,
-            )),
-            area,
-        );
-        return Rect::default();
-    }
-    if view.busy {
-        let mut detail = view
-            .transcript
-            .turn_started
-            .map(|s| activity::format_elapsed(s.elapsed()))
-            .unwrap_or_default();
-        if !view.background_tasks.is_empty() {
-            if !detail.is_empty() {
-                detail.push_str(" · ");
-            }
-            detail.push_str(&format!("后台 {}", view.background_tasks.len()));
-        }
-        let anim_frame = activity::frame_at(view.started_at.elapsed());
-        let label = activity::infer_work_status(view.transcript);
-        let status_line = activity::render_status_line(label, &detail, anim_frame);
-
-        let btn_hovered = matches!(view.hover, HoverTarget::BottomButton);
-        let (right_line, right_w, btn_hit) = if scrolled_up {
-            let btn = "↓ 回到底部";
-            let esc = "Esc 中断 · ";
-            let rw = u16::try_from(esc.width() + btn.width())
-                .unwrap_or(0)
-                .min(area.width);
-            let btn_w = u16::try_from(btn.width()).unwrap_or(0).min(area.width);
-            let btn_style = if btn_hovered {
-                theme::picked_bar()
-            } else {
-                theme::accent_bold()
-            };
-            let line = Line::from(vec![
-                Span::styled(esc, theme::faint()),
-                Span::styled(btn, btn_style),
-            ])
-            .right_aligned();
-            let hit = Rect::new(area.right().saturating_sub(btn_w), area.y, btn_w, 1);
-            (line, rw, hit)
-        } else {
-            let esc = "Esc 中断";
-            let rw = u16::try_from(esc.width()).unwrap_or(0).min(area.width);
-            (Line::styled(esc, theme::faint()).right_aligned(), rw, Rect::default())
-        };
-
-        let left_w = area.width.saturating_sub(right_w.saturating_add(1));
-        if left_w > 0 {
-            frame.render_widget(
-                Paragraph::new(status_line),
-                Rect::new(area.x, area.y, left_w, 1),
-            );
-        }
-        if right_w > 0 {
-            frame.render_widget(
-                Paragraph::new(right_line),
-                Rect::new(area.right().saturating_sub(right_w), area.y, right_w, 1),
-            );
-        }
-        return btn_hit;
-    }
-    let mut btn_hit = Rect::default();
-    let mut right_reserved = 0u16;
-    if scrolled_up {
-        let label = " ↓ 回到底部 (End) ";
-        let style = if matches!(view.hover, HoverTarget::BottomButton) {
-            theme::picked_bar()
-        } else {
-            theme::accent_bold().bg(theme::palette().surface)
-        };
-        let hint = Line::styled(label, style).right_aligned();
-        frame.render_widget(Paragraph::new(hint), area);
-        let btn_w = u16::try_from(label.width()).unwrap_or(0).min(area.width);
-        btn_hit = Rect::new(area.right().saturating_sub(btn_w), area.y, btn_w, 1);
-        right_reserved = btn_w.saturating_add(1);
-    }
-
-    let left_w = area.width.saturating_sub(right_reserved);
-    if left_w > 0 {
-        let left_area = Rect::new(area.x, area.y, left_w, 1);
-        if let Some((msg, is_err)) = view.toast {
-            let style = if is_err { theme::error() } else { theme::good() };
-            frame.render_widget(
-                Paragraph::new(Line::styled(linebreak::clip(msg, left_w), style)),
-                left_area,
-            );
-        } else if !view.background_tasks.is_empty() {
-            let line = render_background_badge_line(
-                view.background_tasks,
-                view.started_at.elapsed(),
-                left_w,
-            );
-            frame.render_widget(Paragraph::new(line), left_area);
-        }
-    }
-    btn_hit
-}
-
-/// 构造空闲态状态行左侧的紧凑后台任务运行标记（如 `◐ 后台任务 1 · sleep 6 · 12s`）。
-///
-/// 参数:
-/// - `tasks`: 当前运行中的后台任务列表
-/// - `app_elapsed`: 应用启动至今时长（用于驱动 250ms 旋转指示符）
-/// - `max_w`: 左侧可用列宽
-///
-/// 返回:
-/// - 适配宽度后的单行 `Line`
-fn render_background_badge_line(
-    tasks: &[BackgroundTask],
-    app_elapsed: std::time::Duration,
-    max_w: u16,
-) -> Line<'static> {
-    const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
-    let spin = SPINNER[((app_elapsed.as_millis() / 250) as usize) % SPINNER.len()];
-    let count = tasks.len();
-    let head_badge = format!("{spin} 后台任务 {count}");
-    let Some(first) = tasks.first() else {
-        return Line::styled(linebreak::clip(&head_badge, max_w), theme::accent());
-    };
-    let elapsed = activity::format_elapsed(first.elapsed());
-    let suffix = if count > 1 {
-        format!(" 等 · {elapsed}")
-    } else {
-        format!(" · {elapsed}")
-    };
-    let head_w = head_badge.width();
-    let suffix_w = suffix.width();
-    let room = usize::from(max_w);
-
-    // 1. 宽度充足时展示「旋转点 + 数量 + 首项任务摘要 + 耗时」
-    if room > head_w + suffix_w + 6 {
-        let summary_room = (room - head_w - suffix_w - 3) as u16;
-        let summary = linebreak::clip(&first.label, summary_room);
-        return Line::from(vec![
-            Span::styled(head_badge, theme::accent()),
-            Span::styled(" · ", theme::faint()),
-            Span::styled(summary, theme::dim()),
-            Span::styled(suffix, theme::faint()),
-        ]);
-    }
-    // 2. 窄屏回退为「旋转点 + 数量 + 耗时」
-    let compact = format!("{head_badge} · {elapsed}");
-    Line::styled(linebreak::clip(&compact, max_w), theme::accent())
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, view: &ViewState<'_>, show_cwd: bool) -> Rect {
@@ -1107,30 +634,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, view: &ViewState<'_>, show_cwd: bo
     Rect::default()
 }
 
-fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, visible: usize, scroll: usize) {
-    let h = usize::from(area.height);
-    if h == 0 || total <= visible {
-        return;
-    }
-    let thumb_h = ((visible * h) / total).clamp(1, h);
-    let max_scroll = total - visible;
-    let thumb_top = if max_scroll == 0 {
-        0
-    } else {
-        (scroll * (h - thumb_h)) / max_scroll
-    };
-    let lines: Vec<Line<'static>> = (0..h)
-        .map(|row| {
-            if row >= thumb_top && row < thumb_top + thumb_h {
-                Line::styled("┃", theme::dim())
-            } else {
-                Line::styled("│", theme::faint())
-            }
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
 fn find_current_user_entry(
     transcript: &Transcript,
     rows: &[RenderRow],
@@ -1153,652 +656,3 @@ fn find_current_user_entry(
         .find(|e| matches!(e.kind, crate::transcript::EntryKind::User { .. }))
         .map(|e| e.id)
 }
-
-#[cfg(test)]
-mod tests {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use unicode_width::UnicodeWidthStr;
-
-    use crate::app::App;
-    use crate::theme::{self, ThemePreset};
-
-    fn buffer_to_text(buf: &ratatui::buffer::Buffer, w: u16, h: u16) -> String {
-        let mut rendered = String::new();
-        for y in 0..h {
-            let mut x = 0;
-            while x < w {
-                let sym = buf[(x, y)].symbol();
-                rendered.push_str(sym);
-                x += u16::try_from(sym.width()).unwrap_or(1).max(1);
-            }
-            rendered.push('\n');
-        }
-        rendered
-    }
-
-    #[test]
-    fn demo_screen_renders_cleanly_at_wide_and_narrow_sizes() {
-        theme::init(ThemePreset::MiyuLavender, true);
-        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
-        app.auto_follow = false;
-        app.scroll = 0;
-
-        for (w, h) in [(140, 46), (84, 34)] {
-            app.auto_follow = false;
-            app.scroll = 0;
-            let backend = TestBackend::new(w, h);
-            let mut terminal = Terminal::new(backend).unwrap();
-            terminal.draw(|f| app.render(f)).unwrap();
-            let top_view = buffer_to_text(terminal.backend().buffer(), w, h);
-            assert!(top_view.contains("修复方案输出"), "missing heading at {w}x{h}");
-            assert!(top_view.contains("┌"), "missing boxed table at {w}x{h}");
-            if w >= 115 {
-                assert!(top_view.contains("工作区"), "missing sidebar at {w}x{h}");
-                assert!(top_view.contains("▰"), "missing context bar fill at {w}x{h}");
-                assert!(
-                    top_view.contains("3分前") && top_view.contains("昨天"),
-                    "sidebar recent sessions should show compact relative time at {w}x{h}:\n{top_view}"
-                );
-            }
-
-            // 滚到底部验证新版 sai 风格代码块、右下角当前目录与 LiteMiyu 收尾元信息行
-            app.auto_follow = true;
-            terminal.draw(|f| app.render(f)).unwrap();
-            let bottom_view = buffer_to_text(terminal.backend().buffer(), w, h);
-            assert!(bottom_view.contains("kotlin"), "missing code language tag at {w}x{h}:\n{bottom_view}");
-            assert!(
-                !bottom_view.contains("╭─ code") && !bottom_view.contains('▎'),
-                "code block should have no decorative borders/rails"
-            );
-            assert!(bottom_view.contains("▣"), "missing done meta row at {w}x{h}");
-            let footer_row = bottom_view.lines().last().unwrap_or("");
-            assert!(
-                footer_row.contains("litemiyu-acp"),
-                "bottom-right footer should show current working directory at {w}x{h}: {footer_row:?}"
-            );
-
-            // 验证框选整块代码块时自动忽略语言标签与左侧边距，只复制纯净代码（保留代码自身缩进）
-            if w == 140 {
-                let bz = app.last_hits.body_text;
-                let code_header_y = app
-                    .last_hits
-                    .row_copy_meta
-                    .iter()
-                    .find(|(y, m)| {
-                        m.decorative
-                            && app
-                                .last_hits
-                                .screen_lines
-                                .get(usize::from(**y))
-                                .is_some_and(|cells| {
-                                    cells
-                                        .iter()
-                                        .filter(|(x, _)| *x >= bz.x && *x < bz.right())
-                                        .map(|(_, s)| s.as_str())
-                                        .collect::<String>()
-                                        .trim()
-                                        == "kotlin"
-                                })
-                    })
-                    .map(|(y, _)| *y)
-                    .expect("find kotlin code header row");
-                let code_sel = crate::ui::TextSelection {
-                    anchor: (bz.x, code_header_y),
-                    head: (bz.right() - 1, code_header_y + 7),
-                    zone: bz,
-                };
-                let copied_code = app.last_hits.extract_selection(code_sel);
-                assert!(
-                    !copied_code.contains("kotlin\n") && !copied_code.starts_with("kotlin"),
-                    "code copy must skip decorative language header:\n{copied_code}"
-                );
-                assert!(
-                    copied_code.starts_with("// OffToLockscreenTransitionViewModel.kt"),
-                    "code copy must strip decorative left margin without extra spaces:\n{copied_code:?}"
-                );
-                assert!(
-                    copied_code.contains("\n    transitionAnimation.sharedFlow("),
-                    "code copy must preserve code's own indentation:\n{copied_code:?}"
-                );
-            }
-
-            // 验证正文区跨行划词提取：精准提取正文且绝不串入右侧边栏
-            if w == 140 {
-                let bz = app.last_hits.body_text;
-                let sel = crate::ui::TextSelection {
-                    anchor: (bz.x, bz.y),
-                    head: (bz.right() - 1, bz.y + 8),
-                    zone: bz,
-                };
-                let picked = app.last_hits.extract_selection(sel);
-                assert!(!picked.is_empty(), "selection should not be empty");
-                assert!(!picked.contains("工作区"), "body selection must not bleed into sidebar: {picked}");
-
-                // 验证点击滚动条、回到底部按钮与上下文进度条
-                app.auto_follow = false;
-                app.scroll = 0;
-                terminal.draw(|f| app.render(f)).unwrap();
-                let bar = app.last_hits.scrollbar;
-                let btn = app.last_hits.bottom_button;
-                let ctx = app.last_hits.sidebar.context_area;
-                assert!(bar.width > 0 && bar.height > 0, "scrollbar hitbox should exist");
-                assert!(btn.width > 0, "bottom button hitbox should exist when scrolled up");
-                assert!(ctx.width > 0 && ctx.height > 0, "context bar hitbox should exist");
-
-                // 1) 点击滚动条中段
-                let mid_y = bar.y + bar.height / 2;
-                app.handle_mouse(crossterm::event::MouseEvent {
-                    kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    column: bar.x,
-                    row: mid_y,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                });
-                app.handle_mouse(crossterm::event::MouseEvent {
-                    kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                    column: bar.x,
-                    row: mid_y,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                });
-                assert!(app.scroll > 0, "clicking scrollbar midpoint should scroll down");
-
-                // 2) 点击回到底部按钮
-                app.handle_mouse(crossterm::event::MouseEvent {
-                    kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    column: btn.x + 1,
-                    row: btn.y,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                });
-                app.handle_mouse(crossterm::event::MouseEvent {
-                    kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                    column: btn.x + 1,
-                    row: btn.y,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                });
-                assert!(app.auto_follow, "clicking bottom button should restore auto_follow");
-
-                // 3) 点击侧边栏上下文进度条弹出状态/压缩浮层
-                app.handle_mouse(crossterm::event::MouseEvent {
-                    kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    column: ctx.x + 2,
-                    row: ctx.bottom() - 1,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                });
-                app.handle_mouse(crossterm::event::MouseEvent {
-                    kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                    column: ctx.x + 2,
-                    row: ctx.bottom() - 1,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                });
-                assert!(
-                    app.picker
-                        .as_ref()
-                        .is_some_and(|p| p.kind == crate::ui::overlay::PickerKind::Status),
-                    "clicking context progress bar should open status/compact picker"
-                );
-                app.picker = None;
-
-                // 4) 验证读取与编辑工具均默认折叠（显示行号范围/增删统计），展开后呈现 sai 风格预览与 Diff
-                app.auto_follow = false;
-                app.scroll = 0;
-                terminal.draw(|f| app.render(f)).unwrap();
-                let collapsed_view = buffer_to_text(terminal.backend().buffer(), w, h);
-                assert!(collapsed_view.contains("44–48"), "missing read range badge:\n{collapsed_view}");
-                assert!(collapsed_view.contains("+1 -0"), "missing diff summary counts:\n{collapsed_view}");
-                assert!(
-                    !collapsed_view.contains("44  val lockscreenAlpha"),
-                    "read preview should be collapsed by default:\n{collapsed_view}"
-                );
-                assert!(
-                    !collapsed_view.contains("+          onFinish = { 1f },"),
-                    "diff should be collapsed by default:\n{collapsed_view}"
-                );
-
-                // 点击读取行（按 diff 相同的点击打开逻辑）单独展开读取预览
-                let read_screen_y = collapsed_view
-                    .lines()
-                    .enumerate()
-                    .find(|(_, l)| l.contains("读取 · OffToLockscreenTransitionViewModel.kt"))
-                    .map(|(y, _)| y as u16)
-                    .expect("find read tool header row");
-                app.handle_mouse(crossterm::event::MouseEvent {
-                    kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    column: bz.x + 2,
-                    row: read_screen_y,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                });
-                app.handle_mouse(crossterm::event::MouseEvent {
-                    kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                    column: bz.x + 2,
-                    row: read_screen_y,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                });
-                terminal.draw(|f| app.render(f)).unwrap();
-                let read_open_view = buffer_to_text(terminal.backend().buffer(), w, h);
-                assert!(
-                    read_open_view.contains("44  val lockscreenAlpha"),
-                    "clicking read tool should open sai-style numbered code preview:\n{read_open_view}"
-                );
-                assert!(
-                    read_open_view.contains("• D:\\Code\\Systemui-dev")
-                        || read_open_view.contains("• D:/Code/Systemui-dev"),
-                    "expanded read tool should show clickable file path like diff:\n{read_open_view}"
-                );
-
-                app.transcript.toggle_all_details(true);
-                terminal.draw(|f| app.render(f)).unwrap();
-                let diff_view = buffer_to_text(terminal.backend().buffer(), w, h);
-                assert!(
-                    diff_view.contains("+          onFinish = { 1f },"),
-                    "missing rendered sai-style unified diff line after expand:\n{diff_view}"
-                );
-                app.transcript.toggle_all_details(false);
-            }
-        }
-    }
-
-    #[test]
-    fn chat_input_box_grows_dynamically_and_caps_at_max_rows() {
-        theme::init(ThemePreset::MiyuLavender, true);
-        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
-        let backend = TestBackend::new(120, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        // 1 行时框高 = 3 (1 + 2 边框)
-        app.editor.set_text("hello");
-        terminal.draw(|f| app.render(f)).unwrap();
-        assert_eq!(app.last_hits.input_area.height, 3);
-
-        // 4 行时自动增高到 6 (4 + 2 边框)
-        app.editor.set_text("line1\nline2\nline3\nline4");
-        terminal.draw(|f| app.render(f)).unwrap();
-        assert_eq!(app.last_hits.input_area.height, 6);
-
-        // 12 行时受 CHAT_INPUT_MAX_ROWS (8) 上限约束，框高 = 10，并显示行号提示
-        let twelve = (1..=12).map(|i| format!("row {i}")).collect::<Vec<_>>().join("\n");
-        app.editor.set_text(twelve);
-        terminal.draw(|f| app.render(f)).unwrap();
-        assert_eq!(
-            app.last_hits.input_area.height,
-            crate::ui::CHAT_INPUT_MAX_ROWS + 2
-        );
-        let rendered = buffer_to_text(terminal.backend().buffer(), 120, 40);
-        assert!(
-            rendered.contains("第 12/12 行"),
-            "missing overflow line counter:\n{rendered}"
-        );
-    }
-
-    #[test]
-    fn resume_picker_shows_current_dir_scope_timestamps_and_switches_to_all() {
-        theme::init(ThemePreset::MiyuLavender, true);
-        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
-        app.editor.set_text("/resume");
-        app.handle_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        let backend = TestBackend::new(120, 36);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.render(f)).unwrap();
-        let cur_view = buffer_to_text(terminal.backend().buffer(), 120, 36);
-        assert!(cur_view.contains("当前目录"), "missing current dir tab:\n{cur_view}");
-        assert!(cur_view.contains("全部会话"), "missing all sessions tab:\n{cur_view}");
-        assert!(cur_view.contains("[当前目录]"), "missing current dir badge:\n{cur_view}");
-
-        // Tab 切换到全部会话，应能看到其他目录的会话
-        app.handle_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Tab,
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        terminal.draw(|f| app.render(f)).unwrap();
-        let all_view = buffer_to_text(terminal.backend().buffer(), 120, 36);
-        assert!(
-            all_view.contains("Android SystemUI"),
-            "switching to All scope should show other-dir session:\n{all_view}"
-        );
-    }
-
-    #[test]
-    fn busy_bottom_status_renders_sai_companion_and_status_label() {
-        theme::init(ThemePreset::MiyuLavender, true);
-        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
-        app.busy = true;
-        app.transcript.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
-        app.transcript.append_thought("checking animation state");
-
-        let backend = TestBackend::new(120, 36);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.render(f)).unwrap();
-        let view = buffer_to_text(terminal.backend().buffer(), 120, 36);
-        assert!(
-            view.contains('‿'),
-            "busy bottom pulse line should render sai companion face:\n{view}"
-        );
-        assert!(
-            view.contains("思考中"),
-            "busy bottom pulse line should reflect active thinking status:\n{view}"
-        );
-        assert!(
-            view.contains("3s"),
-            "busy bottom pulse line should show calm integer seconds:\n{view}"
-        );
-        assert!(
-            view.contains("Esc 中断"),
-            "busy bottom pulse line should keep right-aligned Esc hint:\n{view}"
-        );
-        // 验证状态行紧贴输入框上方，且与正文底部留有 1 行空白分隔
-        let pulse_y = app.last_hits.input_area.y.saturating_sub(1);
-        assert_eq!(
-            app.last_hits.body.bottom() + 1,
-            pulse_y,
-            "body bottom should keep 1 blank row above pulse line"
-        );
-        let lines: Vec<&str> = view.lines().collect();
-        let pulse_row = lines[usize::from(pulse_y)];
-        assert!(
-            pulse_row.contains("思考中") && pulse_row.contains("Esc 中断"),
-            "pulse line should sit directly above input box (row {pulse_y}): {pulse_row:?}"
-        );
-    }
-
-    #[test]
-    fn hover_highlights_sidebar_items_without_affecting_body_fold_rows() {
-        theme::init(ThemePreset::MiyuLavender, true);
-        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
-        let backend = TestBackend::new(140, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.render(f)).unwrap();
-
-        // 1. 悬停侧边栏最近会话条目：触发重绘并给该行铺上 row_focus_bg
-        let (sess_y, sess_id) = app.last_hits.sidebar.session_rows[1].clone();
-        let side_x = app.last_hits.sidebar.area.x + 3;
-        let moved = app.handle_mouse(crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Moved,
-            column: side_x,
-            row: sess_y,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        });
-        assert!(moved);
-        assert_eq!(app.hover, super::HoverTarget::SidebarSession(sess_id));
-
-        // 同一条目内继续移动鼠标不触发无意义重绘
-        let moved_same = app.handle_mouse(crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Moved,
-            column: side_x + 2,
-            row: sess_y,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        });
-        assert!(!moved_same);
-
-        terminal.draw(|f| app.render(f)).unwrap();
-        let buf = terminal.backend().buffer();
-        assert_eq!(buf[(side_x, sess_y)].bg, theme::palette().row_focus_bg);
-
-        // 2. 悬停正文可折叠块（非行内链接）：不触发 hover，保持 HoverTarget::None
-        if let Some((fold_y, _, _, _)) = app
-            .last_hits
-            .body_rows
-            .iter()
-            .find(|(_, _, clickable, links)| *clickable && links.is_empty())
-            .cloned()
-        {
-            let _ = app.handle_mouse(crossterm::event::MouseEvent {
-                kind: crossterm::event::MouseEventKind::Moved,
-                column: app.last_hits.body.x + 1,
-                row: fold_y,
-                modifiers: crossterm::event::KeyModifiers::NONE,
-            });
-            assert_eq!(app.hover, super::HoverTarget::None);
-        }
-    }
-
-    #[test]
-    fn dragging_from_margins_never_copies_right_scrollbar_or_sidebar_divider() {
-        theme::init(ThemePreset::MiyuLavender, true);
-        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
-        app.auto_follow = true;
-        let backend = TestBackend::new(140, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.render(f)).unwrap();
-
-        let bz = app.last_hits.body_text;
-        let bar_col = app
-            .last_hits
-            .scrollbar_col
-            .expect("demo body should have right scrollbar");
-        let side_col = app
-            .last_hits
-            .sidebar_divider_col
-            .expect("wide layout should have sidebar divider");
-        assert!(bar_col >= bz.right(), "scrollbar must sit strictly right of body_text");
-        assert!(side_col > bar_col, "sidebar divider must sit right of scrollbar");
-
-        // 1) 从左侧留白边距 (col=0) 起手拖到右侧边栏内部及输入框下方：不能带入滚动条 ┃/│、侧栏 │、侧栏文字或输入框边框
-        app.handle_mouse(crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: 0,
-            row: bz.y,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        });
-        app.handle_mouse(crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            column: side_col + 10,
-            row: bz.bottom() + 2,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        });
-        let sel = app.selection.expect("margin drag should create selection");
-        assert_eq!(sel.zone, bz, "left-margin drag must clamp to body_text");
-        let picked = app.last_hits.extract_selection(sel);
-        assert!(!picked.is_empty());
-        assert!(
-            !picked.contains('┃') && !picked.contains('╭') && !picked.contains('❯'),
-            "copied text must exclude right scrollbar and input border:\n{picked}"
-        );
-        // 表格以外的正文/代码行绝不能带入右侧滚动条 `│` 或侧栏分隔竖线 `│`
-        for line in picked.lines() {
-            if !line.starts_with('│') && !line.starts_with('┌') && !line.starts_with('├') && !line.starts_with('└') {
-                assert!(
-                    !line.contains('│') && !line.contains('┃'),
-                    "non-table line must not include right decorative bar: {line:?}"
-                );
-            }
-        }
-        assert!(
-            !picked.contains("工作区") && !picked.contains("最近会话"),
-            "copied text must not bleed into sidebar:\n{picked}"
-        );
-
-        // 2) 从滚动条右侧留白边距反向往左拖选底部代码块与正文：同样绝不能带入 ┃ 或 │
-        let right_margin_col = (bar_col + 1).min(side_col.saturating_sub(1));
-        app.handle_mouse(crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: right_margin_col,
-            row: bz.bottom().saturating_sub(1),
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        });
-        app.handle_mouse(crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            column: bz.x,
-            row: bz.bottom().saturating_sub(10),
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        });
-        let rev_sel = app.selection.expect("right-margin drag should create selection");
-        assert_eq!(rev_sel.zone, bz, "right-margin drag must clamp to body_text");
-        let rev_picked = app.last_hits.extract_selection(rev_sel);
-        assert!(
-            !rev_picked.is_empty() && !rev_picked.contains('┃') && !rev_picked.contains('│'),
-            "reverse drag from right margin must exclude decorative bars:\n{rev_picked}"
-        );
-    }
-
-    #[test]
-    fn background_task_badge_appears_after_turn_finishes_and_clears_on_completion() {
-        use crate::acp::{AcpEvent, SessionUpdate};
-
-        theme::init(ThemePreset::MiyuLavender, true);
-        let mut app = App::new(None, "/tmp/demo".into(), None, true, true);
-        app.connecting = false;
-        app.busy = true;
-
-        // 1. 收到一个长时间运行工具调用，回合结束时仍处于 in_progress
-        app.handle_acp_event(AcpEvent::Update {
-            session_id: "demo-8a9f2c11".into(),
-            update: SessionUpdate::ToolCall {
-                call_id: "call_bg_1".into(),
-                name: "run_command".into(),
-                title: "sleep 10 && echo BG_OK".into(),
-                kind: "execute".into(),
-                status: "in_progress".into(),
-                raw_input: Some(serde_json::json!({
-                    "CommandLine": "sleep 10 && echo BG_OK",
-                    "IsDaemon": false
-                })),
-                output: None,
-                diffs: Vec::new(),
-            },
-        });
-        app.handle_acp_event(AcpEvent::PromptFinished {
-            stop_reason: "end_turn".into(),
-            usage: None,
-        });
-        assert!(!app.busy);
-        assert!(app.has_background_tasks());
-
-        let backend = TestBackend::new(140, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.render(f)).unwrap();
-
-        let screen_text: String = app
-            .last_hits
-            .screen_lines
-            .iter()
-            .map(|row| {
-                let mut line = String::new();
-                let mut skip_until = 0u16;
-                for (x, sym) in row {
-                    if *x < skip_until {
-                        continue;
-                    }
-                    let w = u16::try_from(sym.width()).unwrap_or(1).max(1);
-                    line.push_str(sym);
-                    skip_until = *x + w;
-                }
-                line
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            screen_text.contains("后台任务 1"),
-            "idle pulse line should show running background task badge:\n{screen_text}"
-        );
-        assert!(
-            screen_text.contains("后台 1"),
-            "footer should show compact background count:\n{screen_text}"
-        );
-        assert_eq!(
-            app.last_hits.sidebar.bg_rows.len(),
-            1,
-            "sidebar should expose clickable row for running background task"
-        );
-
-        // 2. 收到后台完成通知后标记自动清除
-        app.handle_acp_event(AcpEvent::Update {
-            session_id: "demo-8a9f2c11".into(),
-            update: SessionUpdate::ToolCallUpdate {
-                call_id: "call_bg_1".into(),
-                name: None,
-                title: None,
-                kind: None,
-                status: Some("completed".into()),
-                raw_input: None,
-                output: Some("BG_OK".into()),
-                diffs: Vec::new(),
-            },
-        });
-        assert!(!app.has_background_tasks());
-        terminal.draw(|f| app.render(f)).unwrap();
-        assert!(app.last_hits.sidebar.bg_rows.is_empty());
-    }
-
-    #[test]
-    fn async_followup_keeps_pulse_animation_and_emits_turn_done_line() {
-        use std::time::{Duration, Instant};
-
-        use crate::acp::{AcpEvent, SessionUpdate};
-
-        theme::init(ThemePreset::MiyuLavender, true);
-        let mut app = App::new(None, "/tmp/demo".into(), None, true, true);
-        app.connecting = false;
-        app.busy = false;
-
-        // 1. 回合已空闲时收到服务端异步续答消息：自动进入生成动效活跃态并渲染底行流光
-        app.handle_acp_event(AcpEvent::Update {
-            session_id: "demo-8a9f2c11".into(),
-            update: SessionUpdate::AgentMessageChunk("后台任务已完成，结果正常。".into()),
-        });
-        assert!(app.is_generating());
-
-        let backend = TestBackend::new(140, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.render(f)).unwrap();
-        let active_view = buffer_to_text(terminal.backend().buffer(), 140, 40);
-        assert!(
-            active_view.contains('‿') && active_view.contains("正在生成"),
-            "async follow-up should display bottom pulse animation:\n{active_view}"
-        );
-
-        // 2. 收到末尾 usage_update 并静默超时后自动收尾，落盘 ▣ 轮次结束行并退出活跃态
-        app.handle_acp_event(AcpEvent::Update {
-            session_id: "demo-8a9f2c11".into(),
-            update: SessionUpdate::Usage {
-                used: 20_000,
-                size: 1_000_000,
-            },
-        });
-        app.async_turn_last_event = Some(Instant::now() - Duration::from_secs(1));
-        assert!(app.tick_timers());
-        assert!(!app.is_generating());
-
-        let last = app.transcript.entries.last().expect("has assistant entry");
-        assert!(
-            matches!(&last.kind, crate::transcript::EntryKind::Assistant { done_line: Some(m) } if m.starts_with('▣')),
-            "async follow-up must emit ▣ turn completion line"
-        );
-    }
-
-    #[test]
-    fn finish_turn_emits_done_line_even_when_turn_ends_with_tool_call() {
-        use crate::acp::{AcpEvent, SessionUpdate};
-
-        theme::init(ThemePreset::MiyuLavender, true);
-        let mut app = App::new(None, "/tmp/demo".into(), None, true, true);
-        app.connecting = false;
-        app.busy = true;
-        app.transcript.push_user("检查构建".into(), Vec::new());
-        app.handle_acp_event(AcpEvent::Update {
-            session_id: "demo-8a9f2c11".into(),
-            update: SessionUpdate::ToolCall {
-                call_id: "c_only_tool".into(),
-                name: "run_command".into(),
-                title: "cargo check".into(),
-                kind: "execute".into(),
-                status: "completed".into(),
-                raw_input: None,
-                output: Some("ok".into()),
-                diffs: Vec::new(),
-            },
-        });
-        app.handle_acp_event(AcpEvent::PromptFinished {
-            stop_reason: "end_turn".into(),
-            usage: None,
-        });
-
-        let last = app.transcript.entries.last().expect("has done line entry");
-        assert!(
-            matches!(&last.kind, crate::transcript::EntryKind::Assistant { done_line: Some(m) } if m.starts_with('▣')),
-            "tool-only turn must still emit ▣ turn completion line"
-        );
-    }
-}
-

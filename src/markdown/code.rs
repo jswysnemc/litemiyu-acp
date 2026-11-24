@@ -224,12 +224,11 @@ fn push_merged(out: &mut Vec<Piece>, text: &str, style: Style) {
     if text.is_empty() {
         return;
     }
-    if let Some(last) = out.last_mut() {
-        if last.style == style && last.link.is_none() {
+    if let Some(last) = out.last_mut()
+        && last.style == style && last.link.is_none() {
             last.text.push_str(text);
             return;
         }
-    }
     out.push(Piece::new(text, style));
 }
 
@@ -366,8 +365,8 @@ impl Highlighter {
         let rest = &line.text[line.byte(i)..];
         let c = line.char(i).unwrap_or(' ');
         let prev = i.checked_sub(1).and_then(|p| line.char(p));
-        if let Some([open, close]) = lang.and_then(|l| l.block_comment.as_ref()) {
-            if rest.starts_with(open.as_str()) {
+        if let Some([open, close]) = lang.and_then(|l| l.block_comment.as_ref())
+            && rest.starts_with(open.as_str()) {
                 let Some(at) = rest[open.len()..].find(close.as_str()) else {
                     self.state = State::Comment;
                     return None;
@@ -375,7 +374,6 @@ impl Highlighter {
                 let stop = line.byte(i) + open.len() + at + close.len();
                 return Some((line.index(stop), theme::code_comment()));
             }
-        }
         if let Some(l) = lang {
             let attribute = l.attributes && (rest.starts_with("#[") || rest.starts_with("#!["));
             let spaced = l.comment != "#" || prev.is_none_or(char::is_whitespace);

@@ -362,20 +362,18 @@ fn emit_highlighted_diff_row(
             if run_style == Some(st) {
                 run_text.push_str(g);
             } else {
-                if let Some(prev_st) = run_style.take() {
-                    if !run_text.is_empty() {
+                if let Some(prev_st) = run_style.take()
+                    && !run_text.is_empty() {
                         spans.push(Span::styled(std::mem::take(&mut run_text), prev_st));
                     }
-                }
                 run_text.push_str(g);
                 run_style = Some(st);
             }
         }
-        if let Some(prev_st) = run_style {
-            if !run_text.is_empty() {
+        if let Some(prev_st) = run_style
+            && !run_text.is_empty() {
                 spans.push(Span::styled(run_text, prev_st));
             }
-        }
 
         // 增删行右侧补齐底色至块右边界，形成规整矩形高亮条
         if let Some(bg) = row_bg {

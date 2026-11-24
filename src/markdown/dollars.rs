@@ -67,8 +67,8 @@ fn swap(text: &str) -> String {
         let pair = [("\\[", "\\]", "$$"), ("\\(", "\\)", "$")]
             .into_iter()
             .find(|(open, _, _)| rest.starts_with(open));
-        if let Some((open, close, dollar)) = pair {
-            if let Some(at) = rest[open.len()..].find(close) {
+        if let Some((open, close, dollar)) = pair
+            && let Some(at) = rest[open.len()..].find(close) {
                 let inner = &rest[open.len()..open.len() + at];
                 let inner = if dollar == "$" { inner.trim() } else { inner };
                 out.push_str(dollar);
@@ -77,7 +77,6 @@ fn swap(text: &str) -> String {
                 rest = &rest[open.len() + at + close.len()..];
                 continue;
             }
-        }
         out.push(c);
         rest = &rest[c.len_utf8()..];
     }

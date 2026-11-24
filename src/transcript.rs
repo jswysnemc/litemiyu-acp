@@ -96,8 +96,8 @@ impl Transcript {
     }
 
     pub fn push_user(&mut self, text: String, images: Vec<ImageChip>) {
-        if let Some(last) = self.entries.last_mut() {
-            if matches!(last.kind, EntryKind::User { .. })
+        if let Some(last) = self.entries.last_mut()
+            && matches!(last.kind, EntryKind::User { .. })
                 && self.turn_started.is_none()
                 && last.text.is_empty()
             {
@@ -105,7 +105,6 @@ impl Transcript {
                 last.kind = EntryKind::User { images };
                 return;
             }
-        }
         let id = self.alloc_id();
         self.entries.push(Entry {
             id,
@@ -115,12 +114,11 @@ impl Transcript {
     }
 
     pub fn append_user_chunk(&mut self, chunk: &str) {
-        if let Some(last) = self.entries.last_mut() {
-            if matches!(last.kind, EntryKind::User { .. }) {
+        if let Some(last) = self.entries.last_mut()
+            && matches!(last.kind, EntryKind::User { .. }) {
                 last.text.push_str(chunk);
                 return;
             }
-        }
         let id = self.alloc_id();
         self.entries.push(Entry {
             id,
@@ -130,14 +128,12 @@ impl Transcript {
     }
 
     pub fn append_thought(&mut self, chunk: &str) {
-        if let Some(last) = self.entries.last_mut() {
-            if let EntryKind::Thought { elapsed, .. } = &mut last.kind {
-                if elapsed.is_none() {
+        if let Some(last) = self.entries.last_mut()
+            && let EntryKind::Thought { elapsed, .. } = &mut last.kind
+                && elapsed.is_none() {
                     last.text.push_str(chunk);
                     return;
                 }
-            }
-        }
         let id = self.alloc_id();
         self.entries.push(Entry {
             id,
@@ -155,24 +151,20 @@ impl Transcript {
             if let EntryKind::Thought {
                 started, elapsed, ..
             } = &mut e.kind
-            {
-                if elapsed.is_none() {
+                && elapsed.is_none() {
                     *elapsed = Some(started.elapsed());
                 }
-            }
         }
     }
 
     pub fn append_assistant(&mut self, chunk: &str) {
         self.finish_open_thoughts();
-        if let Some(last) = self.entries.last_mut() {
-            if let EntryKind::Assistant { done_line } = &last.kind {
-                if done_line.is_none() {
+        if let Some(last) = self.entries.last_mut()
+            && let EntryKind::Assistant { done_line } = &last.kind
+                && done_line.is_none() {
                     last.text.push_str(chunk);
                     return;
                 }
-            }
-        }
         let id = self.alloc_id();
         self.entries.push(Entry {
             id,
@@ -206,8 +198,7 @@ impl Transcript {
                 diffs: existing_diffs,
                 ..
             } = &mut e.kind
-            {
-                if *cid == call_id {
+                && *cid == call_id {
                     if let Some(v) = name {
                         *n = v;
                     }
@@ -231,7 +222,6 @@ impl Transcript {
                     }
                     return e.id;
                 }
-            }
         }
 
         let id = self.alloc_id();
@@ -256,12 +246,11 @@ impl Transcript {
     }
 
     pub fn update_plan(&mut self, items: Vec<PlanItem>) {
-        if let Some(last) = self.entries.last_mut() {
-            if let EntryKind::Plan(existing) = &mut last.kind {
+        if let Some(last) = self.entries.last_mut()
+            && let EntryKind::Plan(existing) = &mut last.kind {
                 *existing = items;
                 return;
             }
-        }
         let id = self.alloc_id();
         self.entries.push(Entry {
             id,
@@ -318,14 +307,13 @@ impl Transcript {
         let meta = format!("▣ {}", parts.join(" · "));
 
         // 1. 末条为未关闭的助手回答时直接附着轮次结束行
-        if let Some(last) = self.entries.last_mut() {
-            if let EntryKind::Assistant { done_line } = &mut last.kind
+        if let Some(last) = self.entries.last_mut()
+            && let EntryKind::Assistant { done_line } = &mut last.kind
                 && done_line.is_none()
             {
                 *done_line = Some(meta);
                 return;
             }
-        }
         // 2. 本轮以工具/计划/思考结尾或被中断时，追加独立的轮次结束行，避免 ▣ 汇总丢失
         let has_turn_output = self
             .entries

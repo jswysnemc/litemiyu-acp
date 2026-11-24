@@ -77,6 +77,7 @@ impl InputEditor {
         self.history_idx = None;
     }
 
+    #[cfg(test)]
     pub fn set_text(&mut self, s: impl Into<String>) {
         self.text = s.into();
         self.cursor = self.text.len();
@@ -254,6 +255,27 @@ impl InputEditor {
         };
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
+        self.prune_atoms();
+    }
+
+    /// 将 `[byte_start..cursor]` 区间替换为新文本并将光标移到替换结果末尾（用于 `/ # @` 补全插入）。
+    ///
+    /// 参数:
+    /// - `byte_start`: 替换起始字节偏移（相对全文起点）
+    /// - `replacement`: 写入的替换文本
+    pub fn replace_before_cursor(&mut self, byte_start: usize, replacement: &str) {
+        let clamped = byte_start.min(self.cursor);
+        let start = if self.text.is_char_boundary(clamped) {
+            clamped
+        } else {
+            self.text[..clamped]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(i, _)| i)
+        };
+        self.history_idx = None;
+        self.text.replace_range(start..self.cursor, replacement);
+        self.cursor = start + replacement.len();
         self.prune_atoms();
     }
 
@@ -609,13 +631,11 @@ fn display_width(s: &str) -> usize {
 fn expand_atoms(raw: &str, atoms: &[AtomicToken]) -> String {
     let mut out = raw.to_string();
     for atom in atoms {
-        if atom.kind == AtomKind::PastedText {
-            if let Some(payload) = &atom.payload {
-                if out.contains(&atom.marker) {
+        if atom.kind == AtomKind::PastedText
+            && let Some(payload) = &atom.payload
+                && out.contains(&atom.marker) {
                     out = out.replacen(&atom.marker, payload, 1);
                 }
-            }
-        }
     }
     out
 }

@@ -353,8 +353,8 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
     }
 
     let max_h = usize::from(inner.height);
-    if let Some((start, end)) = context_rows {
-        if start < max_h {
+    if let Some((start, end)) = context_rows
+        && start < max_h {
             let shown_end = end.min(max_h);
             hits.context_area = Rect::new(
                 inner.x,
@@ -363,7 +363,6 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
                 (shown_end - start) as u16,
             );
         }
-    }
     for (row_idx, eid) in bg_marks {
         if row_idx < max_h {
             hits.bg_rows.push((inner.y + row_idx as u16, eid));

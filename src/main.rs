@@ -7,6 +7,7 @@ mod background;
 mod clipboard;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod clipboard_unix;
+mod completion;
 mod diff;
 mod editor;
 mod input;
@@ -21,6 +22,8 @@ mod ui;
 
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -39,7 +42,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-use crate::acp::{AcpClient, AcpCommand, AcpEvent};
+use crate::acp::{AcpClient, AcpEvent};
 use crate::app::{App, UserPrefs};
 use crate::theme::ThemePreset;
 
@@ -142,7 +145,7 @@ async fn main() -> Result<()> {
     let result = run_loop(&mut terminal, &mut app, &mut event_rx).await;
 
     if let Some(client) = &app.client {
-        client.send(AcpCommand::Shutdown);
+        client.shutdown().await;
     }
     let _ = restore_terminal();
     result
@@ -153,6 +156,134 @@ async fn main() -> Result<()> {
 /// 使用 `200µs` 既不会在构造 `PollTimeout` 到进入循环的极短时间内过期，又在底层 `filedescriptor::poll`
 /// 中按毫秒截断为 `0ms` 纯非阻塞。
 const NONBLOCK_POLL_TIMEOUT: Duration = Duration::from_micros(200);
+
+/// 独立终端输入读取线程控制器（支持外部编辑器期间暂停释放 `/dev/tty` 与退出时优雅停机）。
+struct TerminalInputControl {
+    stop: AtomicBool,
+    pause_requested: AtomicBool,
+    paused: Mutex<bool>,
+    cv: Condvar,
+}
+
+struct TerminalInputReader {
+    ctrl: Arc<TerminalInputControl>,
+    rx: mpsc::UnboundedReceiver<Event>,
+}
+
+impl TerminalInputReader {
+    /// 启动后台阻塞输入线程，将终端事件转发至异步通道供 `tokio::select!` 即时消费。
+    ///
+    /// 返回:
+    /// - 包含事件接收端与暂停控制器的 `TerminalInputReader`
+    fn spawn() -> Self {
+        let ctrl = Arc::new(TerminalInputControl {
+            stop: AtomicBool::new(false),
+            pause_requested: AtomicBool::new(false),
+            paused: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker_ctrl = Arc::clone(&ctrl);
+
+        std::thread::spawn(move || {
+            loop {
+                if worker_ctrl.stop.load(Ordering::Acquire) {
+                    break;
+                }
+                // 1. 外部编辑器需要独占 /dev/tty 时，先确认暂停并等待恢复信号
+                if worker_ctrl.pause_requested.load(Ordering::Acquire) {
+                    let mut guard = worker_ctrl
+                        .paused
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *guard = true;
+                    worker_ctrl.cv.notify_all();
+                    while worker_ctrl.pause_requested.load(Ordering::Acquire)
+                        && !worker_ctrl.stop.load(Ordering::Acquire)
+                    {
+                        guard = worker_ctrl
+                            .cv
+                            .wait(guard)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    *guard = false;
+                    continue;
+                }
+                // 2. 以 40ms 轮询终端事件，收到事件后立即排空积压批量送入异步通道
+                match poll(Duration::from_millis(40)) {
+                    Ok(true) => {
+                        if worker_ctrl.pause_requested.load(Ordering::Acquire)
+                            || worker_ctrl.stop.load(Ordering::Acquire)
+                        {
+                            continue;
+                        }
+                        if let Ok(ev) = read() {
+                            if tx.send(ev).is_err() {
+                                break;
+                            }
+                            while !worker_ctrl.pause_requested.load(Ordering::Acquire)
+                                && !worker_ctrl.stop.load(Ordering::Acquire)
+                                && poll(NONBLOCK_POLL_TIMEOUT).unwrap_or(false)
+                            {
+                                match read() {
+                                    Ok(next_ev) => {
+                                        if tx.send(next_ev).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+        });
+
+        Self { ctrl, rx }
+    }
+
+    /// 暂停输入线程并同步等待其彻底停止读取 `/dev/tty`（供 `$EDITOR` 外部编辑器安全接管终端）。
+    fn pause(&mut self) {
+        self.ctrl.pause_requested.store(true, Ordering::Release);
+        let mut guard = self
+            .ctrl
+            .paused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*guard {
+            guard = self
+                .ctrl
+                .cv
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        while self.rx.try_recv().is_ok() {}
+    }
+
+    /// 恢复输入线程继续读取终端事件（外部编辑器退出后调用）。
+    fn resume(&mut self) {
+        while self.rx.try_recv().is_ok() {}
+        let _guard = self
+            .ctrl
+            .paused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ctrl.pause_requested.store(false, Ordering::Release);
+        self.ctrl.cv.notify_all();
+    }
+
+    /// 通知输入线程退出。
+    fn stop(&self) {
+        self.ctrl.stop.store(true, Ordering::Release);
+        self.ctrl.pause_requested.store(false, Ordering::Release);
+        self.ctrl.cv.notify_all();
+    }
+}
 
 /// 使用 DEC Mode 2026 同步输出 + 帧内隐藏光标完成原子重绘，避免终端硬件光标在正文与输入框之间跳动。
 ///
@@ -186,6 +317,7 @@ async fn run_loop(
     app: &mut App,
     event_rx: &mut mpsc::UnboundedReceiver<AcpEvent>,
 ) -> Result<()> {
+    let mut term_input = TerminalInputReader::spawn();
     let mut last_tick = std::time::Instant::now();
     let mut last_bg_draw = std::time::Instant::now();
     let mut dirty = true;
@@ -194,6 +326,7 @@ async fn run_loop(
         if app.external_editor_pending {
             app.external_editor_pending = false;
             let initial = app.prepare_external_editor_buffer();
+            term_input.pause();
             let _ = restore_terminal();
             let edited = editor::edit_in_external_editor(&initial).map_err(|e| e.to_string());
             resume_terminal(app.mouse_capture)?;
@@ -202,6 +335,7 @@ async fn run_loop(
             while poll(NONBLOCK_POLL_TIMEOUT).unwrap_or(false) {
                 let _ = read();
             }
+            term_input.resume();
             app.apply_external_editor_result(edited);
             dirty = true;
         }
@@ -225,6 +359,11 @@ async fn run_loop(
             dirty = true;
         }
 
+        if last_tick.elapsed() >= Duration::from_millis(80) {
+            app.tick = app.tick.wrapping_add(1);
+            last_tick = std::time::Instant::now();
+        }
+
         // 仅在有状态变化、动效进行中或存在后台任务节拍时重绘，空闲零空转
         let animating = app.is_generating() || app.connecting;
         let bg_tick_due = app.has_background_tasks()
@@ -241,57 +380,73 @@ async fn run_loop(
             break;
         }
 
-        // 轮询终端输入（动效期 32ms，空闲期 25ms 保证低延迟响应且空闲不重绘）
-        let timeout = if animating {
-            Duration::from_millis(32)
-        } else {
-            Duration::from_millis(25)
-        };
-        if poll(timeout)? {
-            // 批量收集同一帧内积压的输入，排空内核 tty 与内部解析队列，避免滚轮/快打延迟堆积
-            let mut batch = Vec::with_capacity(16);
-            batch.push(read()?);
-            while batch.len() < 512 && poll(NONBLOCK_POLL_TIMEOUT)? {
-                batch.push(read()?);
-            }
-            for i in 0..batch.len() {
-                let has_more_in_batch = batch[i + 1..].iter().any(|ev| {
-                    matches!(ev, Event::Key(k) if k.kind != KeyEventKind::Release)
-                });
-                let has_more_keys = has_more_in_batch
-                    || (i + 1 == batch.len() && poll(NONBLOCK_POLL_TIMEOUT).unwrap_or(false));
-                match &batch[i] {
-                    Event::Key(key) => {
-                        app.handle_key_queued(*key, has_more_keys);
-                        dirty = true;
+        // 事件驱动等待：同时监听终端输入、ACP 异步流与精确计算的定时唤醒（彻底空闲时 0 唤醒）
+        let mut wait_delay = app.next_timer_delay();
+        if animating {
+            let d = Duration::from_millis(32);
+            wait_delay = Some(wait_delay.map_or(d, |cur| cur.min(d)));
+        } else if app.has_background_tasks() {
+            let rem = Duration::from_millis(250).saturating_sub(last_bg_draw.elapsed());
+            wait_delay = Some(wait_delay.map_or(rem, |cur| cur.min(rem)));
+        }
+
+        tokio::select! {
+            maybe_term = term_input.rx.recv() => {
+                let Some(first_ev) = maybe_term else {
+                    break;
+                };
+                let mut batch = Vec::with_capacity(16);
+                batch.push(first_ev);
+                while batch.len() < 512 {
+                    match term_input.rx.try_recv() {
+                        Ok(ev) => batch.push(ev),
+                        Err(_) => break,
                     }
-                    Event::Paste(text) => {
-                        app.handle_paste(text.clone());
-                        dirty = true;
-                    }
-                    Event::Mouse(mouse) => {
-                        if app.handle_mouse(*mouse) {
+                }
+                for i in 0..batch.len() {
+                    let has_more_in_batch = batch[i + 1..].iter().any(|ev| {
+                        matches!(ev, Event::Key(k) if k.kind != KeyEventKind::Release)
+                    });
+                    let has_more_keys = has_more_in_batch || !term_input.rx.is_empty();
+                    match &batch[i] {
+                        Event::Key(key) => {
+                            app.handle_key_queued(*key, has_more_keys);
                             dirty = true;
                         }
+                        Event::Paste(text) => {
+                            app.handle_paste(text.clone());
+                            dirty = true;
+                        }
+                        Event::Mouse(mouse) => {
+                            if app.handle_mouse(*mouse) {
+                                dirty = true;
+                            }
+                        }
+                        Event::Resize(_, _) => {
+                            dirty = true;
+                        }
+                        _ => {}
                     }
-                    Event::Resize(_, _) => {
-                        dirty = true;
-                    }
-                    _ => {}
                 }
             }
-        }
-
-        while let Ok(ev) = event_rx.try_recv() {
-            app.handle_acp_event(ev);
-            dirty = true;
-        }
-
-        if last_tick.elapsed() >= Duration::from_millis(80) {
-            app.tick = app.tick.wrapping_add(1);
-            last_tick = std::time::Instant::now();
+            maybe_acp = event_rx.recv() => {
+                if let Some(ev) = maybe_acp {
+                    app.handle_acp_event(ev);
+                    dirty = true;
+                    while let Ok(next_ev) = event_rx.try_recv() {
+                        app.handle_acp_event(next_ev);
+                    }
+                }
+            }
+            () = async {
+                match wait_delay {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
         }
     }
+    term_input.stop();
     Ok(())
 }
 

@@ -11,6 +11,8 @@ use crate::clipboard::{
 };
 
 const CLIP_TIMEOUT: Duration = Duration::from_millis(2000);
+/// 剪贴板单次读取字节上限（20MB），超过后立即截断，防止超大位图引发瞬时内存暴涨。
+const MAX_CLIP_BYTES: usize = 20 * 1024 * 1024;
 
 /// 读取 Linux（Wayland / X11）系统剪贴板中的图片、图片文件或文本。
 ///
@@ -21,16 +23,16 @@ const CLIP_TIMEOUT: Duration = Duration::from_millis(2000);
 /// - 解析后的 `ClipboardContent`
 pub fn read_clipboard(prefer_image_only: bool) -> ClipboardContent {
     // 1. Wayland 会话优先使用 wl-paste
-    if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()) {
-        if let Some(content) = read_wayland(prefer_image_only) {
-            return content;
-        }
+    if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        && let Some(content) = read_wayland(prefer_image_only)
+    {
+        return content;
     }
     // 2. X11 / XWayland 兜底使用 xclip
-    if std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty()) {
-        if let Some(content) = read_x11(prefer_image_only) {
-            return content;
-        }
+    if std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty())
+        && let Some(content) = read_x11(prefer_image_only)
+    {
+        return content;
     }
     ClipboardContent::Empty
 }
@@ -42,36 +44,34 @@ fn read_wayland(prefer_image_only: bool) -> Option<ClipboardContent> {
     let types = parse_mime_list(&types_text);
 
     // 1. 优先读取原生图片 MIME（截图工具 / 浏览器复制图片）
-    if let Some(mime) = pick_image_mime(&types) {
-        if let Some(bytes) = run_with_timeout("wl-paste", &["--no-newline", "--type", mime]) {
-            if let Ok(img) = from_image_bytes(mime, &bytes) {
-                return Some(ClipboardContent::Images(vec![img]));
-            }
-        }
+    if let Some(mime) = pick_image_mime(&types)
+        && let Some(bytes) = run_with_timeout("wl-paste", &["--no-newline", "--type", mime])
+        && let Ok(img) = from_image_bytes(mime, &bytes)
+    {
+        return Some(ClipboardContent::Images(vec![img]));
     }
 
     // 2. 尝试读取文件管理器复制的 file:// URI 列表
-    if has_mime(&types, "text/uri-list") {
-        if let Some(uri_bytes) =
+    if has_mime(&types, "text/uri-list")
+        && let Some(uri_bytes) =
             run_with_timeout("wl-paste", &["--no-newline", "--type", "text/uri-list"])
-        {
-            let uri_text = String::from_utf8_lossy(&uri_bytes);
-            if let Some(imgs) = load_images_from_uri_list(&uri_text) {
-                return Some(ClipboardContent::Images(imgs));
-            }
+    {
+        let uri_text = String::from_utf8_lossy(&uri_bytes);
+        if let Some(imgs) = load_images_from_uri_list(&uri_text) {
+            return Some(ClipboardContent::Images(imgs));
         }
     }
 
     // 3. 按需回退到纯文本（若文本本身为图片路径则自动转为图片附件）
-    if !prefer_image_only {
-        if let Some(bytes) = run_with_timeout("wl-paste", &["--no-newline"]) {
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            if let Some(imgs) = try_load_pasted_image_paths(&text) {
-                return Some(ClipboardContent::Images(imgs));
-            }
-            if !text.is_empty() {
-                return Some(ClipboardContent::Text(text));
-            }
+    if !prefer_image_only
+        && let Some(bytes) = run_with_timeout("wl-paste", &["--no-newline"])
+    {
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if let Some(imgs) = try_load_pasted_image_paths(&text) {
+            return Some(ClipboardContent::Images(imgs));
+        }
+        if !text.is_empty() {
+            return Some(ClipboardContent::Text(text));
         }
     }
     None
@@ -84,52 +84,50 @@ fn read_x11(prefer_image_only: bool) -> Option<ClipboardContent> {
     let types = parse_mime_list(&types_text);
 
     // 1. 优先读取图片目标
-    if let Some(mime) = pick_image_mime(&types) {
-        if let Some(bytes) =
+    if let Some(mime) = pick_image_mime(&types)
+        && let Some(bytes) =
             run_with_timeout("xclip", &["-selection", "clipboard", "-t", mime, "-o"])
-        {
-            if let Ok(img) = from_image_bytes(mime, &bytes) {
-                return Some(ClipboardContent::Images(vec![img]));
-            }
-        }
+        && let Ok(img) = from_image_bytes(mime, &bytes)
+    {
+        return Some(ClipboardContent::Images(vec![img]));
     }
 
     // 2. 尝试读取文件 URI 列表
-    if has_mime(&types, "text/uri-list") {
-        if let Some(uri_bytes) = run_with_timeout(
+    if has_mime(&types, "text/uri-list")
+        && let Some(uri_bytes) = run_with_timeout(
             "xclip",
             &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
-        ) {
-            let uri_text = String::from_utf8_lossy(&uri_bytes);
-            if let Some(imgs) = load_images_from_uri_list(&uri_text) {
-                return Some(ClipboardContent::Images(imgs));
-            }
+        )
+    {
+        let uri_text = String::from_utf8_lossy(&uri_bytes);
+        if let Some(imgs) = load_images_from_uri_list(&uri_text) {
+            return Some(ClipboardContent::Images(imgs));
         }
     }
 
     // 3. 回退到纯文本
-    if !prefer_image_only {
-        if let Some(bytes) = run_with_timeout("xclip", &["-selection", "clipboard", "-o"]) {
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            if let Some(imgs) = try_load_pasted_image_paths(&text) {
-                return Some(ClipboardContent::Images(imgs));
-            }
-            if !text.is_empty() {
-                return Some(ClipboardContent::Text(text));
-            }
+    if !prefer_image_only
+        && let Some(bytes) = run_with_timeout("xclip", &["-selection", "clipboard", "-o"])
+    {
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if let Some(imgs) = try_load_pasted_image_paths(&text) {
+            return Some(ClipboardContent::Images(imgs));
+        }
+        if !text.is_empty() {
+            return Some(ClipboardContent::Text(text));
         }
     }
     None
 }
 
-/// 带超时与控制终端隔离执行外部剪贴板命令并收集标准输出。
+/// 带超时、字节上限与控制终端隔离执行外部剪贴板命令并收集标准输出。
 ///
 /// 参数:
 /// - `program`: 可执行文件名（如 `wl-paste` / `xclip`）
 /// - `args`: 命令参数切片
 ///
 /// 返回:
-/// - 命令在超时内成功退出且输出非空时返回 `Some(Vec<u8>)`
+/// - 命令在超时内成功退出、输出非空且未超上限时返回 `Some(Vec<u8>)`
 fn run_with_timeout(program: &str, args: &[&str]) -> Option<Vec<u8>> {
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -139,12 +137,14 @@ fn run_with_timeout(program: &str, args: &[&str]) -> Option<Vec<u8>> {
     detach_from_controlling_tty(&mut cmd);
 
     let mut child = cmd.spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
+    let stdout = child.stdout.take()?;
 
-    // 1. 后台线程读取完整 stdout，防止大图片超过内核管道缓冲导致子进程阻塞
+    // 1. 后台线程限流读取 stdout（上限 MAX_CLIP_BYTES + 1），防止超大剪贴板数据引发内存暴涨
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
+        let _ = stdout
+            .take((MAX_CLIP_BYTES + 1) as u64)
+            .read_to_end(&mut buf);
         buf
     });
 
@@ -154,12 +154,14 @@ fn run_with_timeout(program: &str, args: &[&str]) -> Option<Vec<u8>> {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let data = reader.join().ok()?;
-                return (status.success() && !data.is_empty()).then_some(data);
+                return (status.success() && !data.is_empty() && data.len() <= MAX_CLIP_BYTES)
+                    .then_some(data);
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = reader.join();
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(8));
@@ -167,6 +169,7 @@ fn run_with_timeout(program: &str, args: &[&str]) -> Option<Vec<u8>> {
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = reader.join();
                 return None;
             }
         }
