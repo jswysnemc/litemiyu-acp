@@ -39,37 +39,129 @@ pub struct RenderRow {
 #[derive(Hash, PartialEq, Eq)]
 struct CacheKey {
     entry_id: u64,
-    text_len: usize,
     width: u16,
     preset: u8,
     paint_bg: bool,
 }
 
+#[derive(Hash, PartialEq, Eq)]
+struct ThoughtCacheKey {
+    entry_id: u64,
+    width: u16,
+}
+
 pub struct MdCache {
-    entries: HashMap<CacheKey, Vec<MdLine>>,
+    entries: HashMap<CacheKey, (usize, Vec<MdLine>)>,
+    thoughts: HashMap<ThoughtCacheKey, (usize, Vec<String>)>,
+    diffs: HashMap<(u64, usize), (usize, usize, diff::ComputedDiff)>,
 }
 
 impl MdCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            thoughts: HashMap::new(),
+            diffs: HashMap::new(),
         }
     }
 
+    /// 渲染或命中缓存的 Markdown 行集合（同一 entry 流式增长时原地覆盖，避免清空历史缓存）。
+    ///
+    /// 参数:
+    /// - `entry_id`: 对话条目唯一 ID
+    /// - `text`: Markdown 源码
+    /// - `width`: 渲染宽度
+    ///
+    /// 返回:
+    /// - 已渲染的 `MdLine` 切片
     pub fn render(&mut self, entry_id: u64, text: &str, width: u16) -> &[MdLine] {
         let key = CacheKey {
             entry_id,
-            text_len: text.len(),
             width,
             preset: preset_id(theme::current_preset()),
             paint_bg: theme::paint_bg(),
         };
-        if self.entries.len() > 256 && !self.entries.contains_key(&key) {
+        if self.entries.len() > 512 && !self.entries.contains_key(&key) {
             self.entries.clear();
         }
-        self.entries
+        let text_len = text.len();
+        let slot = self
+            .entries
             .entry(key)
-            .or_insert_with(|| markdown::render(text, width))
+            .or_insert_with(|| (usize::MAX, Vec::new()));
+        if slot.0 != text_len {
+            slot.0 = text_len;
+            slot.1 = markdown::render(text, width);
+        }
+        &slot.1
+    }
+
+    /// 缓存思考文本按宽度的折行结果，避免每 32ms 重跑历史思考的字素切分与折行。
+    ///
+    /// 参数:
+    /// - `entry_id`: 思考条目 ID
+    /// - `trimmed`: 去除首尾空白后的思考文本
+    /// - `inner_w`: 可用列宽
+    ///
+    /// 返回:
+    /// - 折行后的字符串切片
+    pub fn wrap_thought(&mut self, entry_id: u64, trimmed: &str, inner_w: usize) -> &[String] {
+        let key = ThoughtCacheKey {
+            entry_id,
+            width: u16::try_from(inner_w).unwrap_or(u16::MAX),
+        };
+        if self.thoughts.len() > 512 && !self.thoughts.contains_key(&key) {
+            self.thoughts.clear();
+        }
+        let text_len = trimmed.len();
+        let slot = self
+            .thoughts
+            .entry(key)
+            .or_insert_with(|| (usize::MAX, Vec::new()));
+        if slot.0 != text_len {
+            let mut wrapped = Vec::new();
+            for raw_line in trimmed.lines() {
+                let cells: Vec<&str> = raw_line.graphemes(true).collect();
+                for range in linebreak::lines(&cells, inner_w) {
+                    wrapped.push(cells[range].concat());
+                }
+            }
+            slot.0 = text_len;
+            slot.1 = wrapped;
+        }
+        &slot.1
+    }
+
+    /// 缓存工具调用的 Myers Diff 计算结果，避免折叠或历史编辑记录每帧重复计算。
+    ///
+    /// 参数:
+    /// - `entry_id`: 工具条目 ID
+    /// - `diff_idx`: 条目内第几个文件 diff
+    /// - `td`: 原始新旧文本
+    ///
+    /// 返回:
+    /// - 缓存的 `ComputedDiff` 副本
+    pub fn compute_diff(
+        &mut self,
+        entry_id: u64,
+        diff_idx: usize,
+        td: &ToolDiff,
+    ) -> diff::ComputedDiff {
+        let key = (entry_id, diff_idx);
+        if self.diffs.len() > 512 && !self.diffs.contains_key(&key) {
+            self.diffs.clear();
+        }
+        let old_len = td.old_text.len();
+        let new_len = td.new_text.len();
+        if let Some((ol, nl, cached)) = self.diffs.get(&key)
+            && *ol == old_len
+            && *nl == new_len
+        {
+            return cached.clone();
+        }
+        let computed = diff::compute(&td.old_text, &td.new_text);
+        self.diffs.insert(key, (old_len, new_len, computed.clone()));
+        computed
     }
 }
 
@@ -115,7 +207,16 @@ pub fn build_body(
                 started,
                 elapsed,
                 expanded,
-            } => build_thought(entry, *started, *elapsed, *expanded, width, tick, &mut rows),
+            } => build_thought(
+                entry,
+                *started,
+                *elapsed,
+                *expanded,
+                width,
+                tick,
+                cache,
+                &mut rows,
+            ),
             EntryKind::Tool {
                 name,
                 title,
@@ -138,6 +239,7 @@ pub fn build_body(
                 *expanded,
                 width,
                 tick,
+                cache,
                 &mut rows,
             ),
             EntryKind::Assistant { done_line } => {
@@ -257,6 +359,7 @@ fn style_image_chips(
     (spans, links)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_thought(
     entry: &Entry,
     started: std::time::Instant,
@@ -264,6 +367,7 @@ fn build_thought(
     expanded: bool,
     width: u16,
     tick: usize,
+    cache: &mut MdCache,
     out: &mut Vec<RenderRow>,
 ) {
     let busy = elapsed.is_none();
@@ -299,17 +403,11 @@ fn build_thought(
     }
 
     let inner_w = usize::from(width.saturating_sub(2)).max(1);
-    let mut wrapped: Vec<String> = Vec::new();
-    for raw_line in trimmed.lines() {
-        let cells: Vec<&str> = raw_line.graphemes(true).collect();
-        for range in linebreak::lines(&cells, inner_w) {
-            wrapped.push(cells[range].concat());
-        }
-    }
+    let wrapped = cache.wrap_thought(entry.id, trimmed, inner_w);
 
     let preview_limit = 3;
     let shown: &[String] = if expanded || wrapped.len() <= preview_limit {
-        &wrapped
+        wrapped
     } else {
         &wrapped[wrapped.len() - preview_limit..]
     };
@@ -365,6 +463,7 @@ fn build_tool(
     expanded: bool,
     width: u16,
     tick: usize,
+    cache: &mut MdCache,
     out: &mut Vec<RenderRow>,
 ) {
     let (icon, icon_style) = match status {
@@ -413,10 +512,11 @@ fn build_tool(
         format!("{kind_label} · {clean_title}")
     };
 
-    // 预计算每个 diff 的统计，方便标题行直接显示 `+N -M`
+    // 预计算并缓存每个 diff 的统计，避免每帧对历史编辑记录重复执行 Myers Diff
     let computed_diffs: Vec<(&ToolDiff, diff::ComputedDiff)> = diffs
         .iter()
-        .map(|d| (d, diff::compute(&d.old_text, &d.new_text)))
+        .enumerate()
+        .map(|(idx, d)| (d, cache.compute_diff(entry_id, idx, d)))
         .collect();
     let total_added: usize = computed_diffs.iter().map(|(_, c)| c.added).sum();
     let total_removed: usize = computed_diffs.iter().map(|(_, c)| c.removed).sum();

@@ -22,6 +22,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util
 unicode-segmentation = "1"
 unicode-width = "0.2"
 
+[target.'cfg(unix)'.dependencies]
+# Unix 启用 use-dev-tty 电平触发 poll(2)，避免默认 mio EPOLLET 在高频鼠标滚轮与连续按键时停滞
+crossterm = { version = "0.28", features = ["use-dev-tty"] }
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5"
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }

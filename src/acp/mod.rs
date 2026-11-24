@@ -42,6 +42,17 @@ impl AcpClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Unix 下通过 setsid 让 ACP 后端及其派生的后台命令脱离控制终端 /dev/tty，
+        // 防止后台子进程访问或争抢前端 TUI 的键盘与鼠标输入流。
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         let mut child = command
             .spawn()

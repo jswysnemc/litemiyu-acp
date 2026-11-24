@@ -57,21 +57,42 @@ pub fn open_target(target: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("open")
-            .arg(cleaned)
+        let mut cmd = Command::new("open");
+        cmd.arg(cleaned)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        detach_from_controlling_tty(&mut cmd);
+        let _ = cmd.spawn();
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
-        let _ = Command::new("xdg-open")
-            .arg(cleaned)
+        // 1. 必须通过 setsid 脱离控制终端 /dev/tty，防止默认关联为终端编辑器（如 helix/vim）时
+        //    后台子进程打开 /dev/tty 与前端 TUI 争抢键盘和鼠标输入流
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(cleaned)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        detach_from_controlling_tty(&mut cmd);
+        let _ = cmd.spawn();
+    }
+}
+
+/// 在 Unix 子进程启动前调用 `setsid()`，使其创建独立会话并彻底脱离父进程的控制终端 `/dev/tty`。
+///
+/// 参数:
+/// - `cmd`: 待启动的外部命令
+#[cfg(unix)]
+pub(crate) fn detach_from_controlling_tty(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 }
 
@@ -410,5 +431,23 @@ mod tests {
         }
         let png = bmp_to_png(&bmp).expect("valid png");
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_child_cannot_open_controlling_tty() {
+        use super::{Command, Stdio, detach_from_controlling_tty};
+
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec </dev/tty"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach_from_controlling_tty(&mut cmd);
+        let status = cmd.status().expect("spawn sh");
+        assert!(
+            !status.success(),
+            "detached child should fail to open /dev/tty"
+        );
     }
 }

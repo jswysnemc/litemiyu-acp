@@ -824,8 +824,8 @@ impl App {
             _ => {}
         }
 
-        // 3.5 Windows 无括号多行粘贴检测与回放吞并（必须在斜杠菜单与 Enter 发送之前拦截）
-        if cfg!(windows) || has_more_queued_keys {
+        // 3.5 Windows 无括号多行粘贴检测与回放吞并（Linux/macOS 原生支持 Bracketed Paste，避免误拦截快打）
+        if cfg!(windows) {
             match self.windows_paste.handle_key(
                 key,
                 self.editor.text_before_cursor(),

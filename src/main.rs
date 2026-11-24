@@ -16,20 +16,22 @@ mod theme;
 mod transcript;
 mod ui;
 
-use std::io;
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
+use crossterm::cursor;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     KeyEventKind, poll, read,
 };
-use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode,
 };
+use crossterm::{execute, queue};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -129,7 +131,8 @@ async fn main() -> Result<()> {
         EnableMouseCapture
     )?;
     keyboard::enable(&mut stdout);
-    let backend = CrosstermBackend::new(stdout);
+    // 使用 64KB 缓冲包裹 stdout，配合 DEC Mode 2026 同步更新，保证整帧原子提交不撕裂
+    let backend = CrosstermBackend::new(BufWriter::with_capacity(64 * 1024, stdout));
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
@@ -142,12 +145,46 @@ async fn main() -> Result<()> {
     result
 }
 
+/// 非阻塞事件排空超时：
+/// 在 `crossterm` 的 `use-dev-tty` Unix 后端中，`Duration::ZERO` 会被 `while !t.is_zero()` 直接跳过；
+/// 使用 `200µs` 既不会在构造 `PollTimeout` 到进入循环的极短时间内过期，又在底层 `filedescriptor::poll`
+/// 中按毫秒截断为 `0ms` 纯非阻塞。
+const NONBLOCK_POLL_TIMEOUT: Duration = Duration::from_micros(200);
+
+/// 使用 DEC Mode 2026 同步输出 + 帧内隐藏光标完成原子重绘，避免终端硬件光标在正文与输入框之间跳动。
+///
+/// 参数:
+/// - `terminal`: 带缓冲的终端实例
+/// - `app`: 应用状态机
+///
+/// 返回:
+/// - 绘制或终端写入失败时返回错误
+fn draw_frame(
+    terminal: &mut Terminal<CrosstermBackend<BufWriter<io::Stdout>>>,
+    app: &mut App,
+) -> Result<()> {
+    // 1. 挂起终端同步刷新并先隐藏硬件光标，防止写入正文差异时暴露光标移动轨迹
+    queue!(
+        terminal.backend_mut(),
+        BeginSynchronizedUpdate,
+        cursor::Hide
+    )?;
+    // 2. 执行 ratatui 整帧差异渲染（内部在末尾将光标定位到输入框并恢复显示）
+    let draw_res = terminal.draw(|f| app.render(f)).map(|_| ());
+    // 3. 无论绘制是否出错，都必须关闭同步更新并冲刷缓冲，防止终端画面挂起
+    let end_res = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    draw_res?;
+    end_res?;
+    Ok(())
+}
+
 async fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<BufWriter<io::Stdout>>>,
     app: &mut App,
     event_rx: &mut mpsc::UnboundedReceiver<AcpEvent>,
 ) -> Result<()> {
     let mut last_tick = std::time::Instant::now();
+    let mut dirty = true;
 
     loop {
         if app.external_editor_pending {
@@ -158,10 +195,11 @@ async fn run_loop(
             resume_terminal(app.mouse_capture)?;
             terminal.clear()?;
             // 丢弃退出编辑器时残留在终端缓冲区的按键事件，防止误触发发送
-            while poll(Duration::ZERO).unwrap_or(false) {
+            while poll(NONBLOCK_POLL_TIMEOUT).unwrap_or(false) {
                 let _ = read();
             }
             app.apply_external_editor_result(edited);
+            dirty = true;
         }
 
         if let Some(enable) = app.mouse_toggle_pending.take() {
@@ -170,30 +208,36 @@ async fn run_loop(
             } else {
                 let _ = execute!(io::stdout(), DisableMouseCapture);
             }
-        }
-
-        terminal.draw(|f| app.render(f))?;
-
-        if app.should_quit {
-            break;
+            dirty = true;
         }
 
         // 先非阻塞清空全部已到的 ACP 事件
         while let Ok(ev) = event_rx.try_recv() {
             app.handle_acp_event(ev);
+            dirty = true;
         }
 
-        // 轮询终端输入（32ms 统一动效节拍，流光与表情眨眼丝滑且空闲 CPU 极低）
+        // 仅在有状态变化、动效进行中或存在定时消失的 Toast 时重绘，空闲零空转
+        if dirty || app.busy || app.connecting || app.toast.is_some() {
+            draw_frame(terminal, app)?;
+            dirty = false;
+        }
+
+        if app.should_quit {
+            break;
+        }
+
+        // 轮询终端输入（动效期 32ms，空闲期 25ms 保证低延迟响应且空闲不重绘）
         let timeout = if app.busy || app.connecting {
             Duration::from_millis(32)
         } else {
-            Duration::from_millis(80)
+            Duration::from_millis(25)
         };
         if poll(timeout)? {
-            // 批量收集同一帧内积压的输入，便于 Windows 无括号多行粘贴识别与顺滑滚轮
+            // 批量收集同一帧内积压的输入，排空内核 tty 与内部解析队列，避免滚轮/快打延迟堆积
             let mut batch = Vec::with_capacity(16);
             batch.push(read()?);
-            while batch.len() < 512 && poll(Duration::from_millis(0))? {
+            while batch.len() < 512 && poll(NONBLOCK_POLL_TIMEOUT)? {
                 batch.push(read()?);
             }
             for i in 0..batch.len() {
@@ -201,12 +245,23 @@ async fn run_loop(
                     matches!(ev, Event::Key(k) if k.kind != KeyEventKind::Release)
                 });
                 let has_more_keys = has_more_in_batch
-                    || (i + 1 == batch.len() && poll(Duration::from_millis(0)).unwrap_or(false));
+                    || (i + 1 == batch.len() && poll(NONBLOCK_POLL_TIMEOUT).unwrap_or(false));
                 match &batch[i] {
-                    Event::Key(key) => app.handle_key_queued(*key, has_more_keys),
-                    Event::Paste(text) => app.handle_paste(text.clone()),
-                    Event::Mouse(mouse) => app.handle_mouse(*mouse),
-                    Event::Resize(_, _) => {}
+                    Event::Key(key) => {
+                        app.handle_key_queued(*key, has_more_keys);
+                        dirty = true;
+                    }
+                    Event::Paste(text) => {
+                        app.handle_paste(text.clone());
+                        dirty = true;
+                    }
+                    Event::Mouse(mouse) => {
+                        app.handle_mouse(*mouse);
+                        dirty = true;
+                    }
+                    Event::Resize(_, _) => {
+                        dirty = true;
+                    }
                     _ => {}
                 }
             }
@@ -214,6 +269,7 @@ async fn run_loop(
 
         while let Ok(ev) = event_rx.try_recv() {
             app.handle_acp_event(ev);
+            dirty = true;
         }
 
         if last_tick.elapsed() >= Duration::from_millis(80) {
@@ -226,14 +282,17 @@ async fn run_loop(
 
 fn restore_terminal() -> Result<()> {
     let mut stdout = io::stdout();
-    // 1. 必须在离开备用屏之前弹出 Kitty 键盘增强协议，确保与压入落在同一屏幕栈
+    // 1. 必须在离开备用屏之前弹出 Kitty 键盘增强协议，并解除同步更新与光标隐藏
     keyboard::disable(&mut stdout);
     execute!(
         stdout,
+        EndSynchronizedUpdate,
+        cursor::Show,
         DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     )?;
+    let _ = stdout.flush();
     disable_raw_mode()?;
     Ok(())
 }
