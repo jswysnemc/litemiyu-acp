@@ -368,7 +368,7 @@ impl WindowsPasteState {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 mod replay {
     use super::{PasteControl, PasteKey};
     use std::time::Instant;

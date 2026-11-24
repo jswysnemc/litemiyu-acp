@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(windows)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine;
@@ -22,6 +23,7 @@ pub enum ClipboardContent {
     Empty,
 }
 
+#[cfg(windows)]
 static CLIP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub fn copy_text(text: &str) {
@@ -52,7 +54,16 @@ pub fn open_target(target: &str) {
             .stderr(Stdio::null())
             .spawn();
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open")
+            .arg(cleaned)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         let _ = Command::new("xdg-open")
             .arg(cleaned)
@@ -212,6 +223,7 @@ pub fn load_image_file(path: &Path) -> Result<LoadedImage, String> {
     })
 }
 
+#[cfg(windows)]
 fn from_png_bytes(png_bytes: &[u8]) -> Result<LoadedImage, String> {
     if png_bytes.len() > 20 * 1024 * 1024 {
         return Err("剪贴板图片超过 20MB 限制".into());
@@ -226,6 +238,7 @@ fn from_png_bytes(png_bytes: &[u8]) -> Result<LoadedImage, String> {
     })
 }
 
+#[cfg(windows)]
 fn save_clip_png(png_bytes: &[u8]) -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     let dir = PathBuf::from(home).join(".gemini").join("litemiyu-acp-clips");
