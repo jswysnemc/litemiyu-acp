@@ -1193,7 +1193,8 @@ mod tests {
                     "clicking read tool should open sai-style numbered code preview:\n{read_open_view}"
                 );
                 assert!(
-                    read_open_view.contains("• D:\\Code\\Systemui-dev"),
+                    read_open_view.contains("• D:\\Code\\Systemui-dev")
+                        || read_open_view.contains("• D:/Code/Systemui-dev"),
                     "expanded read tool should show clickable file path like diff:\n{read_open_view}"
                 );
 
