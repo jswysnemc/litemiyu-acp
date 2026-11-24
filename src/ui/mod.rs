@@ -57,7 +57,13 @@ impl TextSelection {
 
     pub fn row_col_range(&self, y: u16) -> Option<(u16, u16)> {
         let ((sx, sy), (ex, ey)) = self.ordered();
-        if y < sy || y > ey || self.zone.width == 0 {
+        if y < sy
+            || y > ey
+            || self.zone.width == 0
+            || self.zone.height == 0
+            || y < self.zone.y
+            || y >= self.zone.bottom()
+        {
             return None;
         }
         let z_left = self.zone.x;
@@ -70,18 +76,25 @@ impl TextSelection {
 
 #[derive(Default, Debug, Clone)]
 pub struct FrameHits {
+    /// 主对话栏区域（不含右侧边栏及其分隔竖线）
+    pub main_area: Rect,
     pub body: Rect,
     /// 正文区纯文字区域（不含右侧滚动条列）
     pub body_text: Rect,
     /// 正文右侧滚动条点击/拖动热区
     pub scrollbar: Rect,
+    /// 正文右侧滚动条装饰列（用于划词复制兜底排除 `┃`/`│`）
+    pub scrollbar_col: Option<u16>,
+    /// 右侧边栏左侧分隔竖线列（用于划词复制兜底排除 `│`）
+    pub sidebar_divider_col: Option<u16>,
     /// 「↓ 回到底部」按钮点击热区
     pub bottom_button: Rect,
     /// 底栏右侧上下文/用量点击热区
     pub usage_cell: Rect,
     /// 当前输入框外框区域（用于布局测量与交互定位）
-    #[allow(dead_code)]
     pub input_area: Rect,
+    /// 当前输入框纯文字区（不含圆角边框、`❯` 提示符与迷你滚动条）
+    pub input_text_area: Rect,
     /// 当前输入框文字区净列宽（供多行上下键光标移动与折行严格对齐）
     pub input_text_width: u16,
     pub sidebar: SidebarHits,
@@ -96,7 +109,7 @@ pub struct FrameHits {
 }
 
 impl FrameHits {
-    /// 从当前帧快照中提取选区文字（跳过装饰列/语言标签行、自动拼接软折行、不跨栏、去掉行尾补齐空格）。
+    /// 从当前帧快照中提取选区文字（跳过装饰列/语言标签行/右侧滚动条与边栏竖线、自动拼接软折行、不跨栏、去掉行尾补齐空格）。
     pub fn extract_selection(&self, sel: TextSelection) -> String {
         let ((_, sy), (_, ey)) = sel.ordered();
         let multi_row = sy < ey;
@@ -136,7 +149,13 @@ impl FrameHits {
                 }
                 let w = u16::try_from(sym.width()).unwrap_or(1).max(1);
                 if *x + w > from && *x <= to {
-                    line.push_str(sym);
+                    // 兜底过滤正文右侧滚动条（┃/│）与侧边栏分隔竖线（│），绝不带入剪贴板
+                    let is_right_chrome = (self.scrollbar_col == Some(*x)
+                        && matches!(sym.as_str(), "┃" | "│"))
+                        || (self.sidebar_divider_col == Some(*x) && sym.as_str() == "│");
+                    if !is_right_chrome {
+                        line.push_str(sym);
+                    }
                 }
                 skip_until = *x + w;
             }
@@ -304,8 +323,10 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
 
     // 细腻滚动条（命中热区向左扩 1 列，点击/拖拽更顺手）
     let mut scrollbar_hit = Rect::default();
+    let mut scrollbar_col = None;
     if total_rows > visible_rows && body_area.height >= 3 {
         let bar_x = body_area.right().saturating_sub(1);
+        scrollbar_col = Some(bar_x);
         draw_scrollbar(
             frame,
             Rect::new(bar_x, body_area.y, 1, body_area.height),
@@ -338,8 +359,9 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
     }
 
     // 3. 权限审批抽屉 或 圆角输入框
-    if let Some((req, sel)) = view.permission {
+    let input_text_area = if let Some((req, sel)) = view.permission {
         overlay::draw_permission_drawer(frame, box_area, req, sel);
+        Rect::default()
     } else {
         draw_input_box(
             frame,
@@ -348,8 +370,8 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
             view.picker.is_none(),
             false,
             view.pending_images,
-        );
-    }
+        )
+    };
 
     // 4. 极简底栏（右下角展示用量与当前工作目录）
     let usage_cell = draw_footer(
@@ -386,19 +408,28 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
     }
 
     // 先抓一份本帧纯文本网格，再给选区叠加反色高亮（确保选区与屏幕文字 100% 一致）
-    let body_text = Rect::new(body_area.x, body_area.y, text_room, body_area.height);
+    let body_text = Rect::new(
+        body_area.x,
+        body_area.y,
+        text_room.min(body_area.width.saturating_sub(2).max(1)),
+        body_area.height,
+    );
     let screen_lines = snapshot_buffer(frame.buffer_mut(), full);
     if let Some(sel) = view.selection {
         apply_selection_highlight(frame.buffer_mut(), full, sel, body_text, &row_copy_meta);
     }
 
     FrameHits {
+        main_area,
         body: body_area,
         body_text,
         scrollbar: scrollbar_hit,
+        scrollbar_col,
+        sidebar_divider_col: (side_w > 0).then_some(side_area.x),
         bottom_button,
         usage_cell,
         input_area: box_area,
+        input_text_area,
         input_text_width: input_text_w,
         sidebar: sidebar_hits,
         body_rows: body_hits,
@@ -447,9 +478,10 @@ fn draw_home(frame: &mut Frame, full: Rect, view: &ViewState<'_>) -> FrameHits {
         }
     }
 
-    if let Some((req, sel)) = view.permission {
+    let input_text_area = if let Some((req, sel)) = view.permission {
         let dh = (req.options.len() as u16 + 5).clamp(7, 14);
         overlay::draw_permission_drawer(frame, Rect::new(box_x, box_y, box_w, dh), req, sel);
+        Rect::default()
     } else {
         draw_input_box(
             frame,
@@ -458,8 +490,8 @@ fn draw_home(frame: &mut Frame, full: Rect, view: &ViewState<'_>) -> FrameHits {
             view.picker.is_none(),
             true,
             view.pending_images,
-        );
-    }
+        )
+    };
 
     // 框下模型与工作区
     let info_y = box_area.bottom();
@@ -510,8 +542,10 @@ fn draw_home(frame: &mut Frame, full: Rect, view: &ViewState<'_>) -> FrameHits {
     }
 
     FrameHits {
+        main_area: full,
         usage_cell,
         input_area: box_area,
+        input_text_area,
         input_text_width: text_w,
         screen_lines,
         ..FrameHits::default()
@@ -574,7 +608,7 @@ fn draw_input_box(
     show_cursor: bool,
     is_home: bool,
     pending_images: usize,
-) {
+) -> Rect {
     let text_w = input_text_width(area.width);
     let visible_h = usize::from(area.height.saturating_sub(2));
     let vlines = if editor.is_empty() {
@@ -616,7 +650,7 @@ fn draw_input_box(
     frame.render_widget(block, area);
 
     if inner.width < 4 || inner.height == 0 {
-        return;
+        return Rect::default();
     }
 
     // 左侧提示符 `❯ `
@@ -651,7 +685,7 @@ fn draw_input_box(
         if show_cursor {
             frame.set_cursor_position((text_area.x, text_area.y));
         }
-        return;
+        return text_area;
     }
 
     let scroll = if total_lines <= visible_h {
@@ -703,6 +737,7 @@ fn draw_input_box(
             frame.set_cursor_position((cx, cy));
         }
     }
+    text_area
 }
 
 fn style_input_line(
@@ -1303,6 +1338,85 @@ mod tests {
         assert!(
             view.contains("Esc 中断"),
             "busy bottom pulse line should keep right-aligned Esc hint:\n{view}"
+        );
+    }
+
+    #[test]
+    fn dragging_from_margins_never_copies_right_scrollbar_or_sidebar_divider() {
+        theme::init(ThemePreset::MiyuLavender, true);
+        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+        app.auto_follow = true;
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        let bz = app.last_hits.body_text;
+        let bar_col = app
+            .last_hits
+            .scrollbar_col
+            .expect("demo body should have right scrollbar");
+        let side_col = app
+            .last_hits
+            .sidebar_divider_col
+            .expect("wide layout should have sidebar divider");
+        assert!(bar_col >= bz.right(), "scrollbar must sit strictly right of body_text");
+        assert!(side_col > bar_col, "sidebar divider must sit right of scrollbar");
+
+        // 1) 从左侧留白边距 (col=0) 起手拖到右侧边栏内部及输入框下方：不能带入滚动条 ┃/│、侧栏 │、侧栏文字或输入框边框
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: bz.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: side_col + 10,
+            row: bz.bottom() + 2,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        let sel = app.selection.expect("margin drag should create selection");
+        assert_eq!(sel.zone, bz, "left-margin drag must clamp to body_text");
+        let picked = app.last_hits.extract_selection(sel);
+        assert!(!picked.is_empty());
+        assert!(
+            !picked.contains('┃') && !picked.contains('╭') && !picked.contains('❯'),
+            "copied text must exclude right scrollbar and input border:\n{picked}"
+        );
+        // 表格以外的正文/代码行绝不能带入右侧滚动条 `│` 或侧栏分隔竖线 `│`
+        for line in picked.lines() {
+            if !line.starts_with('│') && !line.starts_with('┌') && !line.starts_with('├') && !line.starts_with('└') {
+                assert!(
+                    !line.contains('│') && !line.contains('┃'),
+                    "non-table line must not include right decorative bar: {line:?}"
+                );
+            }
+        }
+        assert!(
+            !picked.contains("工作区") && !picked.contains("最近会话"),
+            "copied text must not bleed into sidebar:\n{picked}"
+        );
+
+        // 2) 从滚动条右侧留白边距反向往左拖选底部代码块与正文：同样绝不能带入 ┃ 或 │
+        let right_margin_col = (bar_col + 1).min(side_col.saturating_sub(1));
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: right_margin_col,
+            row: bz.bottom().saturating_sub(1),
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: bz.x,
+            row: bz.bottom().saturating_sub(10),
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        let rev_sel = app.selection.expect("right-margin drag should create selection");
+        assert_eq!(rev_sel.zone, bz, "right-margin drag must clamp to body_text");
+        let rev_picked = app.last_hits.extract_selection(rev_sel);
+        assert!(
+            !rev_picked.is_empty() && !rev_picked.contains('┃') && !rev_picked.contains('│'),
+            "reverse drag from right margin must exclude decorative bars:\n{rev_picked}"
         );
     }
 }

@@ -1110,18 +1110,38 @@ impl App {
     }
 
     fn selection_zone(&self, col: u16, row: u16) -> ratatui::layout::Rect {
-        // 优先限定在正文纯文字区或侧边栏纯文字区，跨行拖拽绝不串栏、不带滚动条或竖线
-        if self.last_hits.body_text.width > 0
-            && col >= self.last_hits.body_text.x
-            && col < self.last_hits.body_text.right()
-            && row >= self.last_hits.body_text.y
-            && row < self.last_hits.body_text.bottom()
-        {
-            return self.last_hits.body_text;
-        }
+        // 1. 侧边栏区域（包含左侧分隔竖线列，均自动限定到纯文字区，不带入 `│`）
         let side = self.last_hits.sidebar.area;
-        if side.width > 2 && col >= side.x + 1 && col < side.right() {
-            return ratatui::layout::Rect::new(side.x + 2, side.y, side.width.saturating_sub(2), side.height);
+        if side.width > 2 && col >= side.x && col < side.right() {
+            return ratatui::layout::Rect::new(
+                side.x + 2,
+                side.y,
+                side.width.saturating_sub(2),
+                side.height,
+            );
+        }
+        // 2. 输入框区域：仅选中内部纯文字区，不带入圆角边框 `│`/`╭`/`╰`、`❯` 与迷你滚动条
+        let input_box = self.last_hits.input_area;
+        if input_box.width > 0
+            && self.last_hits.input_text_area.width > 0
+            && rect_contains(input_box, col, row)
+        {
+            return self.last_hits.input_text_area;
+        }
+        // 3. 主对话栏正文区（含左右留白边距、顶部空行与状态行起手拖拽），严格限定在纯文字区，绝不带入右侧滚动条 `┃`/`│` 与边栏竖线 `│`
+        let body_text = self.last_hits.body_text;
+        let main_area = self.last_hits.main_area;
+        let in_main_x = if main_area.width > 0 {
+            col >= main_area.x && col < main_area.right()
+        } else {
+            side.width == 0 || col < side.x
+        };
+        if body_text.width > 0 && in_main_x && (input_box.height == 0 || row < input_box.y) {
+            return body_text;
+        }
+        // 4. 其余区域兜底（如底栏/首页），同样横向限定在主栏内避免越过侧边栏竖线
+        if main_area.width > 0 && main_area.height > 0 {
+            return main_area;
         }
         let rows = u16::try_from(self.last_hits.screen_lines.len()).unwrap_or(1);
         let cols = self

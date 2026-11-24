@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn highlights_shell_command_heads_flags_operators_and_strings() {
-        theme::init(ThemePreset::MiyuNight, true);
+        theme::init(ThemePreset::MiyuLavender, true);
         let pieces = highlight_shell_line(
             r#"cargo test --release && git commit -m "fix bug" # done"#,
             Some("bash"),
