@@ -35,6 +35,23 @@ use overlay::{PickerState, SlashSuggestion};
 use rows::{MdCache, RenderRow, RowCopyMeta, build_body, row_to_line};
 use sidebar::{SidebarData, SidebarHits};
 
+/// 紧凑可交互组件的鼠标悬停目标（不含正文大块与折叠区，避免大面积闪烁）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum HoverTarget {
+    #[default]
+    None,
+    SidebarJump(u64),
+    SidebarSession(String),
+    SidebarContext,
+    BottomButton,
+    UsageCell,
+    BodyLink {
+        row: u16,
+        col_start: u16,
+        col_end: u16,
+    },
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TextSelection {
     pub anchor: (u16, u16),
@@ -205,6 +222,7 @@ pub struct ViewState<'a> {
     pub slash_selected: usize,
     pub pending_images: usize,
     pub selection: Option<TextSelection>,
+    pub hover: &'a HoverTarget,
     pub picker: Option<&'a PickerState>,
     pub permission: Option<(&'a PermissionRequest, usize)>,
 }
@@ -270,13 +288,14 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         let y = footer_y.saturating_sub(box_h);
         (
             Rect::new(content_x, y, content_w, box_h),
-            y.saturating_sub(2),
+            y.saturating_sub(1),
             text_w,
         )
     };
 
     let body_top = main_area.y + 1;
-    let body_bottom = pulse_y.saturating_sub(0).max(body_top);
+    // 正文底部与状态行之间留 1 行呼吸空白，状态行紧贴输入框/抽屉上方
+    let body_bottom = pulse_y.saturating_sub(1).max(body_top);
     let body_area = Rect::new(
         content_x,
         body_top,
@@ -346,10 +365,15 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
     // 计算当前视口对应的用户消息（供侧边栏 `❱` 指示）
     let current_user_entry = find_current_user_entry(view.transcript, &built.rows, scroll, view.auto_follow);
 
-    // 2. 流光运行状态行 / Toast / 可点击的「回到底部」按钮
+    // 2. 流光运行状态行 / Toast / 可点击的「回到底部」按钮（与输入框内沿、底栏左右对齐）
     let mut bottom_button = Rect::default();
     if pulse_y >= body_top && pulse_y < box_area.y {
-        let pulse_area = Rect::new(content_x, pulse_y, content_w, 1);
+        let pulse_area = Rect::new(
+            content_x + 1,
+            pulse_y,
+            content_w.saturating_sub(2),
+            1,
+        );
         bottom_button = draw_pulse_line(
             frame,
             pulse_area,
@@ -393,6 +417,7 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
                 tier: view.tier,
                 current_user_entry,
                 recent_sessions: view.recent_sessions,
+                hover: view.hover,
             },
         )
     } else {
@@ -415,6 +440,28 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         body_area.height,
     );
     let screen_lines = snapshot_buffer(frame.buffer_mut(), full);
+    // 仅对紧凑行内链接叠加悬停下划线与微底色（不作用于正文大块或折叠行）
+    if let HoverTarget::BodyLink {
+        row,
+        col_start,
+        col_end,
+    } = *view.hover
+        && view.selection.is_none()
+        && view.picker.is_none()
+        && view.permission.is_none()
+        && row < full.bottom()
+    {
+        let buf = frame.buffer_mut();
+        let hover_bg = p.row_focus_bg;
+        for x in col_start..col_end.min(full.right()) {
+            let cell = &mut buf[(x, row)];
+            cell.set_style(
+                cell.style()
+                    .bg(hover_bg)
+                    .add_modifier(Modifier::UNDERLINED),
+            );
+        }
+    }
     if let Some(sel) = view.selection {
         apply_selection_highlight(frame.buffer_mut(), full, sel, body_text, &row_copy_meta);
     }
@@ -811,6 +858,7 @@ fn draw_pulse_line(
         let label = activity::infer_work_status(view.transcript);
         let status_line = activity::render_status_line(label, &elapsed, anim_frame);
 
+        let btn_hovered = matches!(view.hover, HoverTarget::BottomButton);
         let (right_line, right_w, btn_hit) = if scrolled_up {
             let btn = "↓ 回到底部";
             let esc = "Esc 中断 · ";
@@ -818,9 +866,14 @@ fn draw_pulse_line(
                 .unwrap_or(0)
                 .min(area.width);
             let btn_w = u16::try_from(btn.width()).unwrap_or(0).min(area.width);
+            let btn_style = if btn_hovered {
+                theme::picked_bar()
+            } else {
+                theme::accent_bold()
+            };
             let line = Line::from(vec![
                 Span::styled(esc, theme::faint()),
-                Span::styled(btn, theme::accent_bold()),
+                Span::styled(btn, btn_style),
             ])
             .right_aligned();
             let hit = Rect::new(area.right().saturating_sub(btn_w), area.y, btn_w, 1);
@@ -852,7 +905,12 @@ fn draw_pulse_line(
     }
     if scrolled_up {
         let label = " ↓ 回到底部 (End) ";
-        let hint = Line::styled(label, theme::accent_bold().bg(theme::palette().surface)).right_aligned();
+        let style = if matches!(view.hover, HoverTarget::BottomButton) {
+            theme::picked_bar()
+        } else {
+            theme::accent_bold().bg(theme::palette().surface)
+        };
+        let hint = Line::styled(label, style).right_aligned();
         frame.render_widget(Paragraph::new(hint), area);
         let btn_w = u16::try_from(label.width()).unwrap_or(0).min(area.width);
         return Rect::new(area.right().saturating_sub(btn_w), area.y, btn_w, 1);
@@ -922,7 +980,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, view: &ViewState<'_>, show_cwd: bo
     };
 
     if usage_w > 0 && usage_w <= avail {
-        right_spans.push(Span::styled(usage_text.clone(), theme::dim()));
+        let usage_style = if matches!(view.hover, HoverTarget::UsageCell) {
+            theme::accent()
+                .bg(theme::palette().row_focus_bg)
+                .add_modifier(Modifier::UNDERLINED)
+        } else {
+            theme::dim()
+        };
+        right_spans.push(Span::styled(usage_text.clone(), usage_style));
         show_usage = true;
     }
 
@@ -1339,6 +1404,70 @@ mod tests {
             view.contains("Esc 中断"),
             "busy bottom pulse line should keep right-aligned Esc hint:\n{view}"
         );
+        // 验证状态行紧贴输入框上方，且与正文底部留有 1 行空白分隔
+        let pulse_y = app.last_hits.input_area.y.saturating_sub(1);
+        assert_eq!(
+            app.last_hits.body.bottom() + 1,
+            pulse_y,
+            "body bottom should keep 1 blank row above pulse line"
+        );
+        let lines: Vec<&str> = view.lines().collect();
+        let pulse_row = lines[usize::from(pulse_y)];
+        assert!(
+            pulse_row.contains("思考中") && pulse_row.contains("Esc 中断"),
+            "pulse line should sit directly above input box (row {pulse_y}): {pulse_row:?}"
+        );
+    }
+
+    #[test]
+    fn hover_highlights_sidebar_items_without_affecting_body_fold_rows() {
+        theme::init(ThemePreset::MiyuLavender, true);
+        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        // 1. 悬停侧边栏最近会话条目：触发重绘并给该行铺上 row_focus_bg
+        let (sess_y, sess_id) = app.last_hits.sidebar.session_rows[1].clone();
+        let side_x = app.last_hits.sidebar.area.x + 3;
+        let moved = app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: side_x,
+            row: sess_y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(moved);
+        assert_eq!(app.hover, super::HoverTarget::SidebarSession(sess_id));
+
+        // 同一条目内继续移动鼠标不触发无意义重绘
+        let moved_same = app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: side_x + 2,
+            row: sess_y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(!moved_same);
+
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(side_x, sess_y)].bg, theme::palette().row_focus_bg);
+
+        // 2. 悬停正文可折叠块（非行内链接）：不触发 hover，保持 HoverTarget::None
+        if let Some((fold_y, _, _, _)) = app
+            .last_hits
+            .body_rows
+            .iter()
+            .find(|(_, _, clickable, links)| *clickable && links.is_empty())
+            .cloned()
+        {
+            let _ = app.handle_mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Moved,
+                column: app.last_hits.body.x + 1,
+                row: fold_y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            });
+            assert_eq!(app.hover, super::HoverTarget::None);
+        }
     }
 
     #[test]

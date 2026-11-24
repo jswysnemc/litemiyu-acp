@@ -256,8 +256,9 @@ async fn run_loop(
                         dirty = true;
                     }
                     Event::Mouse(mouse) => {
-                        app.handle_mouse(*mouse);
-                        dirty = true;
+                        if app.handle_mouse(*mouse) {
+                            dirty = true;
+                        }
                     }
                     Event::Resize(_, _) => {
                         dirty = true;

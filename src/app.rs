@@ -19,7 +19,7 @@ use crate::ui::overlay::{
     parse_timestamp_secs, same_directory,
 };
 use crate::ui::rows::MdCache;
-use crate::ui::{FrameHits, TextSelection, ViewState};
+use crate::ui::{FrameHits, HoverTarget, TextSelection, ViewState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserPrefs {
@@ -134,6 +134,7 @@ pub struct App {
     pub image_seq: usize,
     pub windows_paste: WindowsPasteState,
     pub selection: Option<TextSelection>,
+    pub hover: HoverTarget,
     pub dragging: bool,
     pub dragging_scrollbar: bool,
     pub picker: Option<PickerState>,
@@ -191,6 +192,7 @@ impl App {
             image_seq: 0,
             windows_paste: WindowsPasteState::default(),
             selection: None,
+            hover: HoverTarget::None,
             dragging: false,
             dragging_scrollbar: false,
             picker: None,
@@ -442,6 +444,7 @@ impl App {
             slash_selected: self.slash_selected,
             pending_images: active_pending_images,
             selection: self.selection,
+            hover: &self.hover,
             picker: self.picker.as_ref(),
             permission,
         };
@@ -1067,45 +1070,74 @@ impl App {
         );
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if self.picker.is_some() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    if let Some(p) = &mut self.picker {
-                        p.move_up();
+    /// 处理终端鼠标事件（滚动、悬停高亮、点击与划词拖拽）。
+    ///
+    /// 参数:
+    /// - `mouse`: crossterm 鼠标事件
+    ///
+    /// 返回:
+    /// - 界面状态实际发生变化（需要重绘）时返回 `true`，空白区移动等无效事件返回 `false`
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.picker.is_some() || self.permission.is_some() {
+            let cleared = self.hover != HoverTarget::None;
+            self.hover = HoverTarget::None;
+            if self.picker.is_some() {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        if let Some(p) = &mut self.picker {
+                            p.move_up();
+                        }
+                        return true;
                     }
-                }
-                MouseEventKind::ScrollDown => {
-                    if let Some(p) = &mut self.picker {
-                        p.move_down();
+                    MouseEventKind::ScrollDown => {
+                        if let Some(p) = &mut self.picker {
+                            p.move_down();
+                        }
+                        return true;
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-            return;
+            return cleared;
         }
 
         match mouse.kind {
+            MouseEventKind::Moved => {
+                if self.dragging || self.dragging_scrollbar {
+                    return false;
+                }
+                let next = self.resolve_hover_target(mouse.column, mouse.row);
+                if next != self.hover {
+                    self.hover = next;
+                    return true;
+                }
+                false
+            }
             MouseEventKind::ScrollUp => {
                 self.selection = None;
+                self.hover = HoverTarget::None;
                 self.dragging = false;
                 self.scroll_up(3);
+                true
             }
             MouseEventKind::ScrollDown => {
                 self.selection = None;
+                self.hover = HoverTarget::None;
                 self.dragging = false;
                 self.scroll_down(3);
+                true
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let col = mouse.column;
                 let row = mouse.row;
+                self.hover = HoverTarget::None;
                 // 1. 点击「↓ 回到底部」按钮：立即回到最底部并恢复自动跟随
                 if rect_contains(self.last_hits.bottom_button, col, row) {
                     self.selection = None;
                     self.dragging = false;
                     self.dragging_scrollbar = false;
                     self.jump_to_bottom();
-                    return;
+                    return true;
                 }
                 // 2. 点击/按住正文右侧滚动条：立即按比例定位并开始拖动
                 if rect_contains(self.last_hits.scrollbar, col, row) {
@@ -1113,7 +1145,7 @@ impl App {
                     self.dragging = false;
                     self.dragging_scrollbar = true;
                     self.scroll_to_scrollbar_row(row);
-                    return;
+                    return true;
                 }
                 let zone = self.selection_zone(col, row);
                 self.selection = Some(TextSelection {
@@ -1123,20 +1155,23 @@ impl App {
                 });
                 self.dragging = false;
                 self.dragging_scrollbar = false;
+                true
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let col = mouse.column;
                 let row = mouse.row;
                 if self.dragging_scrollbar {
                     self.scroll_to_scrollbar_row(row);
-                    return;
+                    return true;
                 }
                 if let Some(sel) = &mut self.selection {
                     if (col, row) != sel.anchor {
                         self.dragging = true;
                     }
                     sel.head = (col, row);
+                    return true;
                 }
+                false
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 let col = mouse.column;
@@ -1144,7 +1179,7 @@ impl App {
                 if self.dragging_scrollbar {
                     self.dragging_scrollbar = false;
                     self.scroll_to_scrollbar_row(row);
-                    return;
+                    return true;
                 }
                 if self.dragging {
                     self.dragging = false;
@@ -1160,15 +1195,68 @@ impl App {
                             self.selection = None;
                         }
                     }
-                    return;
+                    return true;
                 }
 
                 // 单击（非拖拽）：取消选区并处理按钮/链接/折叠/侧边栏点击
                 self.selection = None;
                 self.handle_left_click(col, row);
+                true
             }
-            _ => {}
+            _ => false,
         }
+    }
+
+    /// 根据鼠标坐标解析紧凑可交互组件的悬停目标（排除正文大块与折叠区）。
+    ///
+    /// 参数:
+    /// - `col`: 终端列坐标
+    /// - `row`: 终端行坐标
+    ///
+    /// 返回:
+    /// - 命中的紧凑 `HoverTarget`，未命中返回 `HoverTarget::None`
+    fn resolve_hover_target(&self, col: u16, row: u16) -> HoverTarget {
+        // 1. 底部「回到底部」按钮与底栏用量单元格
+        if rect_contains(self.last_hits.bottom_button, col, row) {
+            return HoverTarget::BottomButton;
+        }
+        if rect_contains(self.last_hits.usage_cell, col, row) {
+            return HoverTarget::UsageCell;
+        }
+        // 2. 右侧边栏紧凑交互项（上下文进度区、跳转消息、最近会话）
+        let side = &self.last_hits.sidebar;
+        if side.area.width > 0 && col >= side.area.x && col < side.area.right() {
+            if rect_contains(side.context_area, col, row) {
+                return HoverTarget::SidebarContext;
+            }
+            if let Some((_, eid)) = side.jump_rows.iter().find(|(y, _)| *y == row) {
+                return HoverTarget::SidebarJump(*eid);
+            }
+            if let Some((_, sid)) = side.session_rows.iter().find(|(y, _)| *y == row) {
+                return HoverTarget::SidebarSession(sid.clone());
+            }
+            return HoverTarget::None;
+        }
+        // 3. 正文内紧凑行内链接（不给正文折叠头或整行加 hover）
+        if col >= self.last_hits.body.x && col < self.last_hits.body.right() {
+            let rel_col = col.saturating_sub(self.last_hits.body.x);
+            if let Some((_, _, _, links)) = self
+                .last_hits
+                .body_rows
+                .iter()
+                .find(|(y, _, _, _)| *y == row)
+                && let Some((a, b, _)) = links
+                    .iter()
+                    .find(|(a, b, _)| rel_col >= *a && rel_col < *b)
+            {
+                return HoverTarget::BodyLink {
+                    row,
+                    col_start: self.last_hits.body.x.saturating_add(*a),
+                    col_end: self.last_hits.body.x.saturating_add(*b),
+                };
+            }
+        }
+        HoverTarget::None
     }
 
     fn selection_zone(&self, col: u16, row: u16) -> ratatui::layout::Rect {

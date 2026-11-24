@@ -3,6 +3,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
@@ -12,6 +13,7 @@ use crate::acp::SessionSummary;
 use crate::linebreak;
 use crate::theme;
 use crate::transcript::{Transcript, format_short, short_id};
+use crate::ui::HoverTarget;
 use crate::ui::overlay::format_compact_time;
 
 #[derive(Default, Debug, Clone)]
@@ -29,6 +31,7 @@ pub struct SidebarData<'a> {
     pub tier: Option<&'a str>,
     pub current_user_entry: Option<u64>,
     pub recent_sessions: &'a [SessionSummary],
+    pub hover: &'a HoverTarget,
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHits {
@@ -86,31 +89,63 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
 
     // 3. 上下文（整段可点击查看状态/触发压缩）
     let mut context_rows: Option<(usize, usize)> = None;
+    let hover_bg = theme::palette().row_focus_bg;
     if data.transcript.context_window > 0 {
         lines.push(Line::default());
         let ctx_start = lines.len();
-        lines.push(Line::styled("上下文", theme::side_title()));
+        let ctx_hover = matches!(data.hover, HoverTarget::SidebarContext);
+        let ctx_title_style = if ctx_hover {
+            theme::accent_bold().bg(hover_bg)
+        } else {
+            theme::side_title()
+        };
+        let ctx_meta_style = if ctx_hover {
+            theme::text().bg(hover_bg)
+        } else {
+            theme::dim()
+        };
+        lines.push(pad_hover_line(
+            vec![Span::styled("上下文", ctx_title_style)],
+            w,
+            ctx_hover,
+            hover_bg,
+        ));
         let used = data.transcript.context_used;
         let win = data.transcript.context_window;
         let pct = (used as f64 / win.max(1) as f64) * 100.0;
-        lines.push(Line::styled(
-            format!(
-                "  {} / {} · {:.1}%",
-                format_short(used),
-                format_short(win),
-                pct
-            ),
-            theme::dim(),
+        lines.push(pad_hover_line(
+            vec![Span::styled(
+                format!(
+                    "  {} / {} · {:.1}%",
+                    format_short(used),
+                    format_short(win),
+                    pct
+                ),
+                ctx_meta_style,
+            )],
+            w,
+            ctx_hover,
+            hover_bg,
         ));
-        let bar_w = usize::from(w.saturating_sub(2)).min(22).max(8);
+        let bar_w = usize::from(w.saturating_sub(2)).clamp(8, 22);
         let raw_filled = ((used as f64 / win.max(1) as f64) * bar_w as f64).round() as usize;
         let filled = if used > 0 { raw_filled.max(1) } else { 0 }.min(bar_w);
         let empty = bar_w.saturating_sub(filled);
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled("▰".repeat(filled), theme::accent()),
-            Span::styled("▱".repeat(empty), theme::faint()),
-        ]));
+        let bar_pad = if ctx_hover {
+            Style::new().bg(hover_bg)
+        } else {
+            Style::new()
+        };
+        lines.push(pad_hover_line(
+            vec![
+                Span::styled("  ", bar_pad),
+                Span::styled("▰".repeat(filled), theme::accent().patch(bar_pad)),
+                Span::styled("▱".repeat(empty), theme::faint().patch(bar_pad)),
+            ],
+            w,
+            ctx_hover,
+            hover_bg,
+        ));
         context_rows = Some((ctx_start, lines.len()));
     }
 
@@ -147,16 +182,35 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
             let row_idx = lines.len();
             jump_marks.push((row_idx, eid));
             let is_cur = data.current_user_entry == Some(eid);
-            let lead = if is_cur {
-                Span::styled("❱ ", theme::accent())
+            let is_hover = matches!(data.hover, HoverTarget::SidebarJump(id) if *id == eid);
+            let row_bg = if is_hover {
+                Style::new().bg(hover_bg)
             } else {
-                Span::raw("  ")
+                Style::new()
             };
-            let style = if is_cur { theme::text() } else { theme::dim() };
-            lines.push(Line::from(vec![
-                lead,
-                Span::styled(linebreak::clip(&text, w.saturating_sub(2)), style),
-            ]));
+            let lead = if is_cur {
+                Span::styled("❱ ", theme::accent().patch(row_bg))
+            } else if is_hover {
+                Span::styled("› ", theme::accent().patch(row_bg))
+            } else {
+                Span::styled("  ", row_bg)
+            };
+            let style = if is_hover {
+                theme::text().add_modifier(Modifier::BOLD).patch(row_bg)
+            } else if is_cur {
+                theme::text()
+            } else {
+                theme::dim()
+            };
+            lines.push(pad_hover_line(
+                vec![
+                    lead,
+                    Span::styled(linebreak::clip(&text, w.saturating_sub(2)), style),
+                ],
+                w,
+                is_hover,
+                hover_bg,
+            ));
         }
     }
 
@@ -169,36 +223,57 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
             let row_idx = lines.len();
             session_marks.push((row_idx, s.session_id.clone()));
             let is_cur = data.transcript.session_id.as_deref() == Some(s.session_id.as_str());
-            let lead = if is_cur {
-                Span::styled("❱ ", theme::accent())
+            let is_hover =
+                matches!(data.hover, HoverTarget::SidebarSession(sid) if sid == &s.session_id);
+            let row_bg = if is_hover {
+                Style::new().bg(hover_bg)
             } else {
-                Span::raw("  ")
+                Style::new()
+            };
+            let lead = if is_cur {
+                Span::styled("❱ ", theme::accent().patch(row_bg))
+            } else if is_hover {
+                Span::styled("› ", theme::accent().patch(row_bg))
+            } else {
+                Span::styled("  ", row_bg)
             };
             let label = if s.title.trim().is_empty() {
                 format!("#{}", short_id(&s.session_id))
             } else {
                 s.title.clone()
             };
-            let style = if is_cur { theme::text() } else { theme::dim() };
+            let style = if is_hover {
+                theme::text().add_modifier(Modifier::BOLD).patch(row_bg)
+            } else if is_cur {
+                theme::text()
+            } else {
+                theme::dim()
+            };
+            let time_style = if is_hover {
+                theme::dim().patch(row_bg)
+            } else {
+                theme::faint()
+            };
             let time_str = format_compact_time(&s.updated_at);
             let time_w = time_str.width();
 
-            if !time_str.is_empty() && content_room > time_w + 6 {
+            let spans = if !time_str.is_empty() && content_room > time_w + 6 {
                 let title_room = (content_room - time_w - 1) as u16;
                 let clipped = linebreak::clip(&label, title_room);
                 let pad = content_room.saturating_sub(clipped.width() + time_w).max(1);
-                lines.push(Line::from(vec![
+                vec![
                     lead,
                     Span::styled(clipped, style),
-                    Span::raw(" ".repeat(pad)),
-                    Span::styled(time_str, theme::faint()),
-                ]));
+                    Span::styled(" ".repeat(pad), row_bg),
+                    Span::styled(time_str, time_style),
+                ]
             } else {
-                lines.push(Line::from(vec![
+                vec![
                     lead,
                     Span::styled(linebreak::clip(&label, w.saturating_sub(2)), style),
-                ]));
-            }
+                ]
+            };
+            lines.push(pad_hover_line(spans, w, is_hover, hover_bg));
         }
     }
 
@@ -228,6 +303,32 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
     lines.truncate(max_h);
     frame.render_widget(Paragraph::new(lines), inner);
     hits
+}
+
+/// 悬停高亮行时补齐右侧底色到侧边栏净宽，使高亮条左右齐整。
+///
+/// 参数:
+/// - `spans`: 行内片段
+/// - `width`: 侧边栏净宽
+/// - `hovered`: 是否处于悬停态
+/// - `bg`: 悬停底色
+///
+/// 返回:
+/// - 构造完毕的 `Line`
+fn pad_hover_line(
+    mut spans: Vec<Span<'static>>,
+    width: u16,
+    hovered: bool,
+    bg: ratatui::style::Color,
+) -> Line<'static> {
+    if hovered {
+        let used: usize = spans.iter().map(|s| s.content.width()).sum();
+        let pad = usize::from(width).saturating_sub(used);
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), Style::new().bg(bg)));
+        }
+    }
+    Line::from(spans)
 }
 
 fn wrap_path(path: &str, room: usize) -> Vec<String> {
