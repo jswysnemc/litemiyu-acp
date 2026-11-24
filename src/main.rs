@@ -4,6 +4,8 @@
 mod acp;
 mod app;
 mod clipboard;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod clipboard_unix;
 mod diff;
 mod editor;
 mod input;

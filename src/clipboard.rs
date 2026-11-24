@@ -3,7 +3,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-#[cfg(windows)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine;
@@ -17,14 +16,12 @@ pub struct LoadedImage {
 }
 
 #[derive(Debug)]
-#[cfg_attr(not(windows), allow(dead_code))]
 pub enum ClipboardContent {
     Images(Vec<LoadedImage>),
     Text(String),
     Empty,
 }
 
-#[cfg(windows)]
 static CLIP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub fn copy_text(text: &str) {
@@ -155,7 +152,12 @@ pub fn read_clipboard(prefer_image_only: bool) -> ClipboardContent {
         ClipboardContent::Empty
     }
 
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        crate::clipboard_unix::read_clipboard(prefer_image_only)
+    }
+
+    #[cfg(target_os = "macos")]
     {
         let _ = prefer_image_only;
         ClipboardContent::Empty
@@ -193,11 +195,8 @@ pub fn try_load_pasted_image_paths(raw: &str) -> Option<Vec<LoadedImage>> {
     let mut loaded = Vec::new();
     for line in candidates {
         let cleaned = strip_quotes(line);
-        let path_str = cleaned
-            .strip_prefix("file:///")
-            .or_else(|| cleaned.strip_prefix("file://"))
-            .unwrap_or(cleaned);
-        let path = Path::new(path_str);
+        let decoded = decode_file_uri_to_path(cleaned);
+        let path = Path::new(&decoded);
         if !is_image_extension(path) || !path.is_file() {
             return None;
         }
@@ -245,29 +244,106 @@ pub fn load_image_file(path: &Path) -> Result<LoadedImage, String> {
     })
 }
 
-#[cfg(windows)]
-fn from_png_bytes(png_bytes: &[u8]) -> Result<LoadedImage, String> {
-    if png_bytes.len() > 20 * 1024 * 1024 {
+/// 将 `file://` URI 规范化为本地文件系统路径（兼容 Windows 盘符与 Unix 根 `/` 及百分号编码）。
+///
+/// 参数:
+/// - `raw`: 原始路径或 `file://` URI 字符串
+///
+/// 返回:
+/// - 可供 `Path::new` 直接使用的本地路径字符串
+fn decode_file_uri_to_path(raw: &str) -> String {
+    let Some(rest) = raw
+        .strip_prefix("file://localhost")
+        .or_else(|| raw.strip_prefix("file://"))
+    else {
+        return raw.to_string();
+    };
+    let decoded = percent_decode_utf8(rest);
+    // Windows 下形如 `/D:/foo/bar.png` 需去掉前导 `/`，Unix 下 `/home/foo.png` 必须保留前导 `/`
+    #[cfg(windows)]
+    {
+        if decoded.starts_with('/')
+            && decoded.len() >= 3
+            && decoded.as_bytes()[2] == b':'
+        {
+            return decoded[1..].to_string();
+        }
+    }
+    decoded
+}
+
+fn percent_decode_utf8(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 将剪贴板读取到的原始图片字节编码为 `LoadedImage`（BMP 自动转 PNG，并落盘缓存方便点击查看）。
+///
+/// 参数:
+/// - `mime`: 原始 MIME 类型（如 `image/png`、`image/jpeg`、`image/bmp`）
+/// - `raw`: 原始图片字节
+///
+/// 返回:
+/// - 编码后的 `LoadedImage`
+pub(crate) fn from_image_bytes(mime: &str, raw: &[u8]) -> Result<LoadedImage, String> {
+    if raw.len() > 20 * 1024 * 1024 {
         return Err("剪贴板图片超过 20MB 限制".into());
     }
-    let saved = save_clip_png(png_bytes);
-    let base64_data = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+    let lower = mime.trim().to_ascii_lowercase();
+    let (final_mime, ext, owned): (&str, &str, Option<Vec<u8>>) = match lower.as_str() {
+        "image/png" => ("image/png", "png", None),
+        "image/jpeg" | "image/jpg" => ("image/jpeg", "jpg", None),
+        "image/webp" => ("image/webp", "webp", None),
+        "image/gif" => ("image/gif", "gif", None),
+        "image/bmp" => ("image/png", "png", Some(bmp_to_png(raw)?)),
+        _ => return Err(format!("不支持的剪贴板图片类型：{mime}")),
+    };
+    let bytes = owned.as_deref().unwrap_or(raw);
+    let saved = save_clip_image(bytes, ext);
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(bytes);
     Ok(LoadedImage {
-        mime_type: "image/png".to_string(),
+        mime_type: final_mime.to_string(),
         base64_data,
         path: saved,
-        byte_len: png_bytes.len(),
+        byte_len: bytes.len(),
     })
 }
 
 #[cfg(windows)]
-fn save_clip_png(png_bytes: &[u8]) -> Option<PathBuf> {
+fn from_png_bytes(png_bytes: &[u8]) -> Result<LoadedImage, String> {
+    from_image_bytes("image/png", png_bytes)
+}
+
+fn save_clip_image(bytes: &[u8], ext: &str) -> Option<PathBuf> {
     let dir = crate::paths::clip_cache_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     let seq = CLIP_SEQ.fetch_add(1, Ordering::Relaxed);
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let path = dir.join(format!("clip_{ts}_{seq}.png"));
-    std::fs::write(&path, png_bytes).ok()?;
+    let path = dir.join(format!("clip_{ts}_{seq}.{ext}"));
+    std::fs::write(&path, bytes).ok()?;
     Some(path)
 }
 
@@ -449,5 +525,12 @@ mod tests {
             !status.success(),
             "detached child should fail to open /dev/tty"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decodes_unix_file_uri_with_leading_slash_and_percent_encoding() {
+        let path = super::decode_file_uri_to_path("file:///home/snemc/%E5%9B%BE%E7%89%87%201.png");
+        assert_eq!(path, "/home/snemc/图片 1.png");
     }
 }

@@ -695,6 +695,14 @@ impl App {
             self.editor.move_to_end();
             return;
         }
+        if is_ctrl_char(key.code, key.modifiers, 'v')
+            || (matches!(key.code, KeyCode::Char('v' | 'V'))
+                && key.modifiers == KeyModifiers::ALT)
+        {
+            self.windows_paste.reset();
+            self.paste_from_clipboard(false);
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.windows_paste.reset();
@@ -724,12 +732,6 @@ impl App {
                     self.last_ctrl_c = Some(Instant::now());
                     self.toast("再按一次 Ctrl+C 退出", false);
                 }
-                return;
-            }
-            (KeyCode::Char('v'), KeyModifiers::CONTROL)
-            | (KeyCode::Char('v'), KeyModifiers::ALT) => {
-                self.windows_paste.reset();
-                self.paste_from_clipboard(false);
                 return;
             }
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
