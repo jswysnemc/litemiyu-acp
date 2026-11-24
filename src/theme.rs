@@ -289,11 +289,17 @@ fn build_palette(preset: ThemePreset, paint_bg: bool) -> Palette {
         ThemePreset::Terminal => {
             let mut t = md3_overlay(&NIGHT, 0x8b7cf6, true);
             t.background = Color::Reset;
+            t.surface = Color::Reset;
+            t.panel_bg = Color::Reset;
+            t.md_code_bg = Color::Reset;
             t
         }
     };
     if !paint_bg {
         p.background = Color::Reset;
+        p.surface = Color::Reset;
+        p.panel_bg = Color::Reset;
+        p.md_code_bg = Color::Reset;
     }
     p
 }
@@ -492,4 +498,30 @@ pub fn code_macro() -> Style {
 }
 pub fn code_parameter() -> Style {
     Style::new().fg(palette().code_parameter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transparent_and_terminal_theme_clear_code_block_background() {
+        let terminal = build_palette(ThemePreset::Terminal, false);
+        assert_eq!(terminal.background, Color::Reset);
+        assert_eq!(terminal.surface, Color::Reset);
+        assert_eq!(terminal.panel_bg, Color::Reset);
+        assert_eq!(terminal.md_code_bg, Color::Reset);
+
+        let transparent_lavender = build_palette(ThemePreset::MiyuLavender, false);
+        assert_eq!(transparent_lavender.background, Color::Reset);
+        assert_eq!(transparent_lavender.surface, Color::Reset);
+        assert_eq!(transparent_lavender.panel_bg, Color::Reset);
+        assert_eq!(transparent_lavender.md_code_bg, Color::Reset);
+
+        let opaque_lavender = build_palette(ThemePreset::MiyuLavender, true);
+        assert_ne!(opaque_lavender.background, Color::Reset);
+        assert_ne!(opaque_lavender.surface, Color::Reset);
+        assert_ne!(opaque_lavender.panel_bg, Color::Reset);
+        assert_ne!(opaque_lavender.md_code_bg, Color::Reset);
+    }
 }
