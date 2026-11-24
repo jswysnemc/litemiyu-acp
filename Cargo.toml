@@ -1,0 +1,33 @@
+[package]
+name = "litemiyu-acp"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight high-aesthetics ACP TUI client inspired by LiteMiyu, designed for agy acp and any ACP v1 server"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+material-colors = { version = "0.5", default-features = false, features = ["std"] }
+png = "0.17"
+pulldown-cmark = { version = "0.13", default-features = false }
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = { version = "2", default-features = false, features = ["text"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "sync", "time"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5"
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = "s"
+strip = true
