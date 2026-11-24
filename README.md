@@ -91,3 +91,8 @@ litemiyu-acp --transparent
 ## 开源许可
 
 本项目的 Markdown 折行、表格与词法高亮表（`resources/code.json`）及配色思路参考自 [miyu-agent/litemiyu](https://github.com/miyu-agent/litemiyu)，遵循 `AGPL-3.0-or-later` 许可发布。
+
+## 友情链接
+
+- [LINUX DO](https://linux.do/) — 新的理想型社区
+
