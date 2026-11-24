@@ -241,10 +241,12 @@ fn parse_command(raw: &str) -> (String, Vec<String>) {
     if parts.is_empty() {
         return ("agy".into(), vec!["acp".into()]);
     }
-    let mut program = parts.remove(0);
+    let program = parts.remove(0);
     #[cfg(windows)]
-    if program.eq_ignore_ascii_case("agy") {
-        program = "agy.exe".into();
-    }
+    let program = if program.eq_ignore_ascii_case("agy") {
+        "agy.exe".into()
+    } else {
+        program
+    };
     (program, parts)
 }

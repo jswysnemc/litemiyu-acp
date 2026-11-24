@@ -17,6 +17,7 @@ pub struct LoadedImage {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum ClipboardContent {
     Images(Vec<LoadedImage>),
     Text(String),
