@@ -1288,6 +1288,51 @@
         "patch"
       ],
       "diff": true
+    },
+    {
+      "names": [
+        "mermaid",
+        "mmd"
+      ],
+      "comment": "%%",
+      "keywords": [
+        "flowchart",
+        "graph",
+        "subgraph",
+        "end",
+        "sequenceDiagram",
+        "participant",
+        "actor",
+        "as",
+        "Note",
+        "over",
+        "alt",
+        "else",
+        "opt",
+        "loop",
+        "par",
+        "and",
+        "stateDiagram",
+        "stateDiagram-v2",
+        "state",
+        "direction",
+        "classDiagram",
+        "erDiagram",
+        "gantt",
+        "pie",
+        "title",
+        "classDef",
+        "class",
+        "style",
+        "linkStyle"
+      ],
+      "constants": [
+        "LR",
+        "RL",
+        "TD",
+        "TB",
+        "BT"
+      ]
     }
   ]
 }

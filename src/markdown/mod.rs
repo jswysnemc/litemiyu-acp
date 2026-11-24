@@ -5,6 +5,7 @@
 pub mod code;
 pub mod dollars;
 pub mod inline;
+pub mod mermaid;
 pub mod table;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -421,6 +422,43 @@ impl Renderer {
             });
         }
 
+        // 1. Mermaid 代码块优先走纯 Rust Unicode 框线渲染；暂不支持的类型回退到高亮源码
+        if mermaid::is_mermaid_lang(lang_trimmed)
+            && let Some(diagram_lines) = mermaid::render(&body, code_w)
+        {
+            for diagram_line in diagram_lines {
+                let mut used_w = 0usize;
+                let mut spans = Vec::with_capacity(diagram_line.spans.len() + 3);
+                if left_inset > 0 {
+                    spans.push(Span::raw(" ".repeat(left_inset)));
+                }
+                spans.push(Span::styled(" ".repeat(inner_pad_left), bg_style));
+                for span in diagram_line.spans {
+                    used_w += span.content.width();
+                    spans.push(Span::styled(span.content, span.style.bg(code_bg)));
+                }
+                let pad = card_w.saturating_sub(inner_pad_left + used_w);
+                if pad > 0 {
+                    spans.push(Span::styled(" ".repeat(pad), bg_style));
+                }
+                let lead = self.lead(is_first_row);
+                let lead_w: usize = lead.iter().map(|s| s.content.width()).sum();
+                is_first_row = false;
+                self.out.push(MdLine {
+                    lead,
+                    folded: Folded {
+                        spans,
+                        links: Vec::new(),
+                        joined: false,
+                    },
+                    content_offset: u16::try_from(lead_w + left_inset + inner_pad_left)
+                        .unwrap_or(u16::MAX),
+                    decorative: false,
+                });
+            }
+            return;
+        }
+
         let mut hl = code::Highlighter::new(code::find_language(lang_trimmed));
         for raw_line in body.trim_end_matches('\n').split('\n') {
             let pieces = hl.line(raw_line);
@@ -632,6 +670,47 @@ mod tests {
             "missing decorative kotlin header: {texts:#?}"
         );
         assert!(!texts.iter().any(|l| l.contains("╭─ code") || l.contains('▎')));
+    }
+
+    #[test]
+    fn mermaid_code_block_renders_box_diagram_and_falls_back_gracefully() {
+        let sample = "```mermaid\nflowchart LR\n    A[用户输入] --> B[ACP Client]\n    B --> C{响应类型}\n```\n";
+        let lines = render(sample, 80);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.to_spans()
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = texts.join("\n");
+        assert!(joined.contains("用户输入"));
+        assert!(joined.contains("ACP Client"));
+        assert!(joined.contains("◇ 响应类型"));
+        assert!(joined.contains('▶'));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.decorative && l.to_spans().iter().any(|s| s.content.contains("mermaid"))),
+            "should retain decorative mermaid tag"
+        );
+
+        // 暂未图形化的 Mermaid 类型（如 pie）平滑回退到高亮代码块
+        let fallback_sample = "```mermaid\npie title 占比\n    \"A\" : 60\n    \"B\" : 40\n```\n";
+        let fallback_lines = render(fallback_sample, 80);
+        let fallback_text: String = fallback_lines
+            .iter()
+            .map(|l| {
+                l.to_spans()
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(fallback_text.contains("pie title 占比"));
     }
 }
 
