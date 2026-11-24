@@ -5,6 +5,7 @@
 //! 本模块在进入备用屏后按需探测并压入 `DISAMBIGUATE_ESCAPE_CODES`，退出备用屏前成对弹出。
 
 use std::io::Write;
+#[cfg(any(not(windows), test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(not(windows))]
@@ -17,6 +18,7 @@ use crossterm::event::{
 #[cfg(not(windows))]
 use crossterm::execute;
 
+#[cfg(any(not(windows), test))]
 static ENHANCEMENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// 探测当前终端是否支持 Kitty 键盘增强协议（进程内仅探测一次）。
