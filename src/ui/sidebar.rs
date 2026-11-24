@@ -12,6 +12,7 @@ use crate::acp::SessionSummary;
 use crate::linebreak;
 use crate::theme;
 use crate::transcript::{Transcript, format_short, short_id};
+use crate::ui::overlay::format_compact_time;
 
 #[derive(Default, Debug, Clone)]
 pub struct SidebarHits {
@@ -163,6 +164,7 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
     if !data.recent_sessions.is_empty() {
         lines.push(Line::default());
         lines.push(Line::styled("最近会话", theme::side_title()));
+        let content_room = usize::from(w.saturating_sub(2));
         for s in data.recent_sessions.iter().take(8) {
             let row_idx = lines.len();
             session_marks.push((row_idx, s.session_id.clone()));
@@ -178,10 +180,25 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
                 s.title.clone()
             };
             let style = if is_cur { theme::text() } else { theme::dim() };
-            lines.push(Line::from(vec![
-                lead,
-                Span::styled(linebreak::clip(&label, w.saturating_sub(2)), style),
-            ]));
+            let time_str = format_compact_time(&s.updated_at);
+            let time_w = time_str.width();
+
+            if !time_str.is_empty() && content_room > time_w + 6 {
+                let title_room = (content_room - time_w - 1) as u16;
+                let clipped = linebreak::clip(&label, title_room);
+                let pad = content_room.saturating_sub(clipped.width() + time_w).max(1);
+                lines.push(Line::from(vec![
+                    lead,
+                    Span::styled(clipped, style),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(time_str, theme::faint()),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    lead,
+                    Span::styled(linebreak::clip(&label, w.saturating_sub(2)), style),
+                ]));
+            }
         }
     }
 

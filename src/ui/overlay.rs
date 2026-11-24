@@ -740,6 +740,38 @@ pub fn format_relative_time(raw: &str) -> String {
     }
 }
 
+/// 紧凑版相对时间（专供右侧边栏窄列展示，宽度控制在 4~6 列：如 `刚刚`、`3分前`、`2时前`、`昨天`、`5天前`、`11-20`）。
+pub fn format_compact_time(raw: &str) -> String {
+    let Some(ts) = parse_timestamp_secs(raw) else {
+        return String::new();
+    };
+    let now = Local::now();
+    let Some(dt) = Local.timestamp_opt(ts, 0).single() else {
+        return String::new();
+    };
+    let diff = now.timestamp().saturating_sub(ts);
+    if diff < 60 {
+        "刚刚".to_string()
+    } else if diff < 3600 {
+        format!("{}分前", diff / 60)
+    } else if diff < 24 * 3600 && dt.date_naive() == now.date_naive() {
+        format!("{}时前", diff / 3600)
+    } else {
+        let days = now.date_naive().signed_duration_since(dt.date_naive()).num_days();
+        if days <= 0 {
+            format!("{}时前", (diff / 3600).max(1))
+        } else if days == 1 {
+            "昨天".to_string()
+        } else if days < 30 {
+            format!("{days}天前")
+        } else if dt.year() == now.year() {
+            dt.format("%m-%d").to_string()
+        } else {
+            dt.format("%y-%m").to_string()
+        }
+    }
+}
+
 /// 跨平台规范化目录路径比较（Windows 忽略盘符/目录大小写与正反斜杠差异）。
 pub fn same_directory(a: &str, b: &str) -> bool {
     let norm = |p: &str| {

@@ -1013,6 +1013,10 @@ mod tests {
             if w >= 115 {
                 assert!(top_view.contains("工作区"), "missing sidebar at {w}x{h}");
                 assert!(top_view.contains("▰"), "missing context bar fill at {w}x{h}");
+                assert!(
+                    top_view.contains("3分前") && top_view.contains("昨天"),
+                    "sidebar recent sessions should show compact relative time at {w}x{h}:\n{top_view}"
+                );
             }
 
             // 滚到底部验证新版 sai 风格代码块、右下角当前目录与 LiteMiyu 收尾元信息行
