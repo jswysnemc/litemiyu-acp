@@ -241,8 +241,7 @@ fn from_png_bytes(png_bytes: &[u8]) -> Result<LoadedImage, String> {
 
 #[cfg(windows)]
 fn save_clip_png(png_bytes: &[u8]) -> Option<PathBuf> {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    let dir = PathBuf::from(home).join(".gemini").join("litemiyu-acp-clips");
+    let dir = crate::paths::clip_cache_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     let seq = CLIP_SEQ.fetch_add(1, Ordering::Relaxed);
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
@@ -340,8 +339,7 @@ pub fn bmp_to_png(bmp: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(windows)]
 fn read_clipboard_image_powershell() -> Option<LoadedImage> {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    let dir = PathBuf::from(home).join(".gemini").join("litemiyu-acp-clips");
+    let dir = crate::paths::clip_cache_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     let seq = CLIP_SEQ.fetch_add(1, Ordering::Relaxed);
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");

@@ -11,6 +11,7 @@ mod keyboard;
 mod linebreak;
 mod markdown;
 mod paste;
+mod paths;
 mod theme;
 mod transcript;
 mod ui;

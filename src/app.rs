@@ -1,6 +1,5 @@
 //! 应用核心状态机：整合 ACP 异步事件、键盘/鼠标交互、斜杠命令与用户偏好持久化。
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -51,23 +50,27 @@ impl Default for UserPrefs {
 }
 
 impl UserPrefs {
-    fn path() -> Option<PathBuf> {
-        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-        Some(PathBuf::from(home).join(".gemini").join("litemiyu-acp.json"))
-    }
-
     pub fn load() -> Self {
-        let Some(p) = Self::path() else {
-            return Self::default();
-        };
-        std::fs::read_to_string(p)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        // 1. 优先读取独立配置路径（$XDG_CONFIG_HOME/litemiyu-acp/prefs.json 或 %APPDATA%\litemiyu-acp\prefs.json）
+        if let Some(p) = crate::paths::prefs_path()
+            && let Ok(s) = std::fs::read_to_string(&p)
+            && let Ok(prefs) = serde_json::from_str::<Self>(&s)
+        {
+            return prefs;
+        }
+        // 2. 兼容读取旧版 ~/.gemini/litemiyu-acp.json，并自动落盘迁移到独立配置路径
+        if let Some(legacy) = crate::paths::legacy_prefs_path()
+            && let Ok(s) = std::fs::read_to_string(&legacy)
+            && let Ok(prefs) = serde_json::from_str::<Self>(&s)
+        {
+            prefs.save();
+            return prefs;
+        }
+        Self::default()
     }
 
     pub fn save(&self) {
-        if let Some(p) = Self::path() {
+        if let Some(p) = crate::paths::prefs_path() {
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
