@@ -15,6 +15,7 @@ pub struct LoadedImage {
     pub byte_len: usize,
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Debug)]
 pub enum ClipboardContent {
     Images(Vec<LoadedImage>),
@@ -22,6 +23,7 @@ pub enum ClipboardContent {
     Empty,
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 static CLIP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub fn copy_text(text: &str) {
@@ -39,6 +41,7 @@ pub fn copy_text(text: &str) {
 }
 
 /// 剪贴板截图落盘缓存最多保留的近期文件数，防止长期使用无限累积。
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const MAX_CACHED_CLIPS: usize = 50;
 
 pub fn open_target(target: &str) {
@@ -308,6 +311,7 @@ fn hex_val(b: u8) -> Option<u8> {
 ///
 /// 返回:
 /// - 编码后的 `LoadedImage`
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn from_image_bytes(mime: &str, raw: &[u8]) -> Result<LoadedImage, String> {
     if raw.len() > 20 * 1024 * 1024 {
         return Err("剪贴板图片超过 20MB 限制".into());
@@ -337,6 +341,7 @@ fn from_png_bytes(png_bytes: &[u8]) -> Result<LoadedImage, String> {
     from_image_bytes("image/png", png_bytes)
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn save_clip_image(bytes: &[u8], ext: &str) -> Option<PathBuf> {
     let dir = crate::paths::clip_cache_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
@@ -353,6 +358,7 @@ fn save_clip_image(bytes: &[u8], ext: &str) -> Option<PathBuf> {
 /// 参数:
 /// - `dir`: 缓存目录路径
 /// - `max_keep`: 允许保留的最大文件数量
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn prune_clip_cache(dir: &Path, max_keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

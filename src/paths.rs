@@ -30,6 +30,7 @@ pub fn legacy_prefs_path() -> Option<PathBuf> {
 /// 返回:
 /// - Unix: `$XDG_CACHE_HOME/litemiyu-acp/clips` 或 `~/.cache/litemiyu-acp/clips`
 /// - Windows: `%LOCALAPPDATA%\litemiyu-acp\clips`（回退系统临时目录）
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn clip_cache_dir() -> Option<PathBuf> {
     cache_dir()
         .map(|d| d.join("clips"))
@@ -45,6 +46,7 @@ fn config_dir() -> Option<PathBuf> {
     )
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn cache_dir() -> Option<PathBuf> {
     resolve_cache_dir(
         cfg!(windows),
@@ -77,6 +79,7 @@ fn resolve_config_dir(
     home.map(|h| h.join(".config").join(APP_DIR_NAME))
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn resolve_cache_dir(
     is_windows: bool,
     local_appdata: Option<OsString>,

@@ -28,6 +28,7 @@ enum PendingKind {
 
 pub struct AcpClient {
     cmd_tx: mpsc::UnboundedSender<AcpCommand>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
 }
 
