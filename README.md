@@ -1,5 +1,8 @@
 # litemiyu-acp
 
+[![CI](https://github.com/jswysnemc/litemiyu-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/jswysnemc/litemiyu-acp/actions/workflows/ci.yml)
+[![Release](https://github.com/jswysnemc/litemiyu-acp/actions/workflows/release.yml/badge.svg)](https://github.com/jswysnemc/litemiyu-acp/releases)
+
 参考 [LiteMiyu](https://github.com/miyu-agent/litemiyu) 的视觉美学与 Markdown 渲染引擎、并借鉴 [sai](https://github.com/jswysnemc/sai) 交互细节打造的纯 Rust 超轻量 **ACP v1（[Agent Client Protocol](https://agentclientprotocol.com)）** 终端 TUI 客户端。默认直连 `agy acp`，亦可通过 `--cmd` 接入任意基于 `stdio` 的标准 ACP v1 Agent。
 
 ## 支持的 ACP 后端（兼容列表）
@@ -41,6 +44,8 @@
   - 输入框支持随内容自动增高、Windows 无括号多行粘贴防误发、长文本与图片原子芯片删除，以及双行卡片式 `/resume` 会话选择器（支持 `Tab` 切换当前目录 / 全部会话）。
 
 ## 安装与运行
+
+可以直接在 [GitHub Releases](https://github.com/jswysnemc/litemiyu-acp/releases) 下载对应平台预编译包（Windows x64 / Linux x64 & arm64 / macOS arm64 & x64，附 `SHA256SUMS.txt`），或从源码构建：
 
 ```powershell
 # 从源码构建并安装到 PATH
