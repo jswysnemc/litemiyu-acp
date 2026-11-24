@@ -645,8 +645,8 @@ impl App {
     }
 
     pub fn handle_key_queued(&mut self, key: KeyEvent, has_more_queued_keys: bool) {
-        // Windows crossterm 会同时上报 Release 事件，必须忽略防止双击！
-        if key.kind == KeyEventKind::Release {
+        // Windows crossterm 会同时上报 Release 事件，Kitty 增强协议可能上报裸修饰键，统一忽略
+        if key.kind == KeyEventKind::Release || matches!(key.code, KeyCode::Modifier(_)) {
             return;
         }
 
@@ -766,6 +766,11 @@ impl App {
                 return;
             }
             (KeyCode::BackTab, _) => {
+                self.windows_paste.reset();
+                self.cycle_mode();
+                return;
+            }
+            (KeyCode::Tab, m) if m.contains(KeyModifiers::SHIFT) => {
                 self.windows_paste.reset();
                 self.cycle_mode();
                 return;
@@ -894,7 +899,8 @@ impl App {
             {
                 self.editor.insert_char('\n');
             }
-            (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('\n'), _)
+            | (KeyCode::Char('j' | 'J'), KeyModifiers::CONTROL) => {
                 self.editor.insert_char('\n');
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
@@ -2061,5 +2067,29 @@ mod tests {
         app.apply_external_editor_result(Ok("外部编辑后的新内容\n第二行".into()));
         assert_eq!(app.editor.text(), "外部编辑后的新内容\n第二行");
         assert_eq!(app.editor.text_before_cursor(), "外部编辑后的新内容\n第二行");
+    }
+
+    #[test]
+    fn shift_enter_and_lf_insert_newline_without_submitting() {
+        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+        let initial_entries = app.transcript.entries.len();
+        app.editor.set_text("第一行");
+
+        // 1. Kitty 键盘增强协议上报的 Shift+Enter 插入换行，不提交消息
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.editor.text(), "第一行\n");
+        assert_eq!(app.transcript.entries.len(), initial_entries);
+
+        // 2. 终端直接发送的裸 LF（\n）同样插入换行，不提交消息
+        app.handle_key(KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE));
+        assert_eq!(app.editor.text(), "第一行\n\n");
+        assert_eq!(app.transcript.entries.len(), initial_entries);
+
+        // 3. 裸修饰键事件被忽略，不清空输入
+        app.handle_key(KeyEvent::new(
+            KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift),
+            KeyModifiers::SHIFT,
+        ));
+        assert_eq!(app.editor.text(), "第一行\n\n");
     }
 }

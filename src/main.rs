@@ -7,6 +7,7 @@ mod clipboard;
 mod diff;
 mod editor;
 mod input;
+mod keyboard;
 mod linebreak;
 mod markdown;
 mod paste;
@@ -126,6 +127,7 @@ async fn main() -> Result<()> {
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
+    keyboard::enable(&mut stdout);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -222,14 +224,16 @@ async fn run_loop(
 }
 
 fn restore_terminal() -> Result<()> {
-    disable_raw_mode()?;
     let mut stdout = io::stdout();
+    // 1. 必须在离开备用屏之前弹出 Kitty 键盘增强协议，确保与压入落在同一屏幕栈
+    keyboard::disable(&mut stdout);
     execute!(
         stdout,
         DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     )?;
+    disable_raw_mode()?;
     Ok(())
 }
 
@@ -240,6 +244,7 @@ fn resume_terminal(mouse_capture: bool) -> Result<()> {
     if mouse_capture {
         execute!(stdout, EnableMouseCapture)?;
     }
+    keyboard::enable(&mut stdout);
     Ok(())
 }
 
