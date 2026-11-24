@@ -84,6 +84,27 @@ impl InputEditor {
         self.history_idx = None;
     }
 
+    /// 返回展开粘贴原子块后的完整正文（不清空当前缓冲，供外部编辑器 `Ctrl+G` 打开编辑）。
+    pub fn expanded_text(&self) -> String {
+        expand_atoms(&self.text, &self.atoms)
+    }
+
+    /// 用外部编辑器返回的正文替换输入内容，并保留仍存在于文本中的图片原子芯片。
+    pub fn replace_from_external(&mut self, text: String, keep_image_markers: &[String]) {
+        self.text = text;
+        self.cursor = self.text.len();
+        self.history_idx = None;
+        self.atoms = keep_image_markers
+            .iter()
+            .filter(|marker| !marker.is_empty() && self.text.contains(marker.as_str()))
+            .map(|marker| AtomicToken {
+                marker: marker.clone(),
+                kind: AtomKind::Image,
+                payload: None,
+            })
+            .collect();
+    }
+
     /// 返回当前输入中全部有效原子元素的有序字节区间。
     pub fn atom_spans(&self) -> Vec<AtomSpan> {
         let mut spans = Vec::new();
@@ -375,6 +396,16 @@ impl InputEditor {
             .map_or(self.text.len(), |i| self.cursor + i);
     }
 
+    /// 光标移至整个输入框最开头（`Ctrl+A`）。
+    pub fn move_to_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// 光标移至整个输入框最末尾（`Ctrl+E`）。
+    pub fn move_to_end(&mut self) {
+        self.cursor = self.text.len();
+    }
+
     /// 在多行输入框中上移一个视觉行；若已在首行则返回 `false`（可回退到历史上一条）。
     pub fn move_up(&mut self, width: u16) -> bool {
         let lines = self.visual_lines(width);
@@ -643,5 +674,26 @@ mod tests {
         assert!(!ed.move_up(20));
         assert!(ed.move_down(20));
         assert_eq!(ed.cursor_visual(20).0, 1);
+
+        // Ctrl+A / Ctrl+E 跨多行直达整个输入框开头与末尾
+        ed.move_to_start();
+        assert_eq!(ed.text_before_cursor(), "");
+        ed.move_to_end();
+        assert_eq!(ed.text_before_cursor(), "第一行\n第二行\n第三行");
+    }
+
+    #[test]
+    fn external_editor_expands_paste_and_preserves_surviving_image_atoms() {
+        let mut ed = InputEditor::new();
+        ed.insert_image_atom("[图片 1]".into());
+        ed.insert_str(" ");
+        let _ = ed.insert_pasted_text("a\nb\nc\nd\ne");
+        assert_eq!(ed.expanded_text(), "[图片 1] a\nb\nc\nd\ne");
+
+        ed.replace_from_external("已修改 [图片 1] 正文".into(), &["[图片 1]".into(), "[图片 2]".into()]);
+        assert_eq!(ed.text(), "已修改 [图片 1] 正文");
+        assert_eq!(ed.text_before_cursor(), "已修改 [图片 1] 正文");
+        assert_eq!(ed.atom_spans().len(), 1);
+        assert_eq!(ed.atom_spans()[0].kind, AtomKind::Image);
     }
 }

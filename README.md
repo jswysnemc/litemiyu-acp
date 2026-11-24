@@ -75,6 +75,8 @@ litemiyu-acp --transparent
 | 按键 / 命令 | 功能 |
 | --- | --- |
 | `Enter` / `Shift+Enter` (`Ctrl+J`) | 发送消息 / 换行（多行输入支持 `↑`/`↓` 优先在行间移动光标） |
+| `Ctrl+A` / `Ctrl+E` | 光标直达输入框最开头 / 最末尾（`Home`/`End` 移至当前行首尾） |
+| `Ctrl+G`（别名 `Alt+G`） | 使用 `$VISUAL` / `$EDITOR`（Windows 默认 `notepad.exe`）编辑输入内容，保存后自动替换 |
 | `Ctrl+V` / `Alt+V` / 拖拽图片 | 粘贴剪贴板截图、复制的图片文件或拖拽图片路径（以原子芯片渲染，一键整体删除） |
 | `/image [路径]`（别名 `/img`） | 从剪贴板或指定本地路径附加图片 |
 | `Shift+Tab` | 快速切换执行模式（`default` / `accept-edits` / `plan`） |

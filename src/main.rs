@@ -5,6 +5,7 @@ mod acp;
 mod app;
 mod clipboard;
 mod diff;
+mod editor;
 mod input;
 mod linebreak;
 mod markdown;
@@ -146,6 +147,20 @@ async fn run_loop(
     let mut last_tick = std::time::Instant::now();
 
     loop {
+        if app.external_editor_pending {
+            app.external_editor_pending = false;
+            let initial = app.prepare_external_editor_buffer();
+            let _ = restore_terminal();
+            let edited = editor::edit_in_external_editor(&initial).map_err(|e| e.to_string());
+            resume_terminal(app.mouse_capture)?;
+            terminal.clear()?;
+            // 丢弃退出编辑器时残留在终端缓冲区的按键事件，防止误触发发送
+            while poll(Duration::ZERO).unwrap_or(false) {
+                let _ = read();
+            }
+            app.apply_external_editor_result(edited);
+        }
+
         if let Some(enable) = app.mouse_toggle_pending.take() {
             if enable {
                 let _ = execute!(io::stdout(), EnableMouseCapture);
@@ -215,6 +230,16 @@ fn restore_terminal() -> Result<()> {
         DisableBracketedPaste,
         LeaveAlternateScreen
     )?;
+    Ok(())
+}
+
+fn resume_terminal(mouse_capture: bool) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    if mouse_capture {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     Ok(())
 }
 

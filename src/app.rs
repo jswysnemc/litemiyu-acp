@@ -121,6 +121,7 @@ pub struct App {
     pub show_sidebar: bool,
     pub mouse_capture: bool,
     pub mouse_toggle_pending: Option<bool>,
+    pub external_editor_pending: bool,
     pub all_expanded: bool,
     pub tick: usize,
     pub started_at: Instant,
@@ -177,6 +178,7 @@ impl App {
             show_sidebar,
             mouse_capture: true,
             mouse_toggle_pending: None,
+            external_editor_pending: false,
             all_expanded: false,
             tick: 0,
             started_at: Instant::now(),
@@ -663,6 +665,30 @@ impl App {
         }
 
         // 3. 全局快捷键
+        if is_ctrl_char(key.code, key.modifiers, 'g')
+            || (matches!(key.code, KeyCode::Char('g' | 'G'))
+                && key.modifiers == KeyModifiers::ALT)
+        {
+            self.windows_paste.reset();
+            self.selection = None;
+            self.dragging = false;
+            self.external_editor_pending = true;
+            return;
+        }
+        if is_ctrl_char(key.code, key.modifiers, 'a') {
+            self.windows_paste.reset();
+            self.selection = None;
+            self.dragging = false;
+            self.editor.move_to_start();
+            return;
+        }
+        if is_ctrl_char(key.code, key.modifiers, 'e') {
+            self.windows_paste.reset();
+            self.selection = None;
+            self.dragging = false;
+            self.editor.move_to_end();
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.windows_paste.reset();
@@ -894,12 +920,8 @@ impl App {
             }
             (KeyCode::Left, _) => self.editor.move_left(),
             (KeyCode::Right, _) => self.editor.move_right(),
-            (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-                self.editor.move_home();
-            }
-            (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-                self.editor.move_end();
-            }
+            (KeyCode::Home, _) => self.editor.move_home(),
+            (KeyCode::End, _) => self.editor.move_end(),
             (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
                 self.editor.delete_word_back();
                 self.prune_pending_images();
@@ -928,6 +950,37 @@ impl App {
                 self.editor.insert_char(c);
             }
             _ => {}
+        }
+    }
+
+    /// 准备写入外部编辑器（`$EDITOR` / `notepad.exe`）的输入正文（展开大段粘贴块）。
+    pub fn prepare_external_editor_buffer(&self) -> String {
+        self.editor.expanded_text()
+    }
+
+    /// 外部编辑器退出后，将编辑后的正文替换回输入框并同步待发送图片附件。
+    pub fn apply_external_editor_result(&mut self, result: Result<String, String>) {
+        self.windows_paste.reset();
+        match result {
+            Ok(edited) => {
+                let prev = self.editor.expanded_text();
+                let markers: Vec<String> = self
+                    .pending_images
+                    .iter()
+                    .map(|img| img.label.clone())
+                    .collect();
+                self.editor.replace_from_external(edited.clone(), &markers);
+                self.prune_pending_images();
+                if edited == prev {
+                    self.toast("外部编辑器未修改内容", false);
+                } else {
+                    let chars = edited.chars().count();
+                    self.toast(format!("已从外部编辑器替换输入 ({chars} 字符)"), false);
+                }
+            }
+            Err(err) => {
+                self.toast(err, true);
+            }
         }
     }
 
@@ -1792,6 +1845,8 @@ impl App {
     fn open_help_picker(&mut self) {
         let rows = [
             ("Enter / Shift+Enter", "发送消息 / 输入换行（亦支持 Ctrl+J、Alt+Enter）"),
+            ("Ctrl+A / Ctrl+E", "光标移至输入框最开头 / 最末尾（Home/End 移至当前行首尾）"),
+            ("Ctrl+G (Alt+G)", "用 $EDITOR / notepad.exe 打开输入框正文，保存退出后替换"),
             ("Ctrl+V / Alt+V / 拖拽", "粘贴截图/图片或大段文本（自动折叠为原子块，退格一键删除）"),
             ("/image [路径]", "手动粘贴剪贴板图片或附加指定本地图片"),
             ("Shift + Tab", "快速循环切换执行模式 (default / accept-edits / plan)"),
@@ -1941,6 +1996,26 @@ impl App {
     }
 }
 
+fn is_ctrl_char(code: KeyCode, modifiers: KeyModifiers, target: char) -> bool {
+    let lower = target.to_ascii_lowercase();
+    let upper = target.to_ascii_uppercase();
+    if modifiers == KeyModifiers::CONTROL
+        && matches!(code, KeyCode::Char(c) if c == lower || c == upper)
+    {
+        return true;
+    }
+    // 兼容部分终端直接发送 ASCII 控制字符（Ctrl+A = 0x01 .. Ctrl+Z = 0x1A）
+    if lower.is_ascii_lowercase() {
+        let ctrl_ch = ((lower as u8) - b'a' + 1) as char;
+        if matches!(code, KeyCode::Char(c) if c == ctrl_ch)
+            && !modifiers.contains(KeyModifiers::ALT)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn rect_contains(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
     rect.width > 0
         && rect.height > 0
@@ -1948,4 +2023,43 @@ fn rect_contains(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
         && col < rect.right()
         && row >= rect.y
         && row < rect.bottom()
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::*;
+
+    #[test]
+    fn ctrl_a_ctrl_e_and_ctrl_g_shortcuts_work_on_multiline_input() {
+        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+        app.editor.set_text("line1\nline2\nline3");
+
+        // Ctrl+A 回到整个输入框最开头（即便在多行末尾）
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.editor.text_before_cursor(), "");
+
+        // Ctrl+E 回到整个输入框最末尾
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.editor.text_before_cursor(), "line1\nline2\nline3");
+
+        // 兼容 ASCII 控制字符形式（0x01 / 0x05 / 0x07）
+        app.handle_key(KeyEvent::new(KeyCode::Char('\x01'), KeyModifiers::NONE));
+        assert_eq!(app.editor.text_before_cursor(), "");
+        app.handle_key(KeyEvent::new(KeyCode::Char('\x05'), KeyModifiers::NONE));
+        assert_eq!(app.editor.text_before_cursor(), "line1\nline2\nline3");
+
+        // Ctrl+G 触发外部编辑器挂起标志，回调替换后光标落在末尾
+        assert!(!app.external_editor_pending);
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert!(app.external_editor_pending);
+        app.external_editor_pending = false;
+
+        let initial = app.prepare_external_editor_buffer();
+        assert_eq!(initial, "line1\nline2\nline3");
+        app.apply_external_editor_result(Ok("外部编辑后的新内容\n第二行".into()));
+        assert_eq!(app.editor.text(), "外部编辑后的新内容\n第二行");
+        assert_eq!(app.editor.text_before_cursor(), "外部编辑后的新内容\n第二行");
+    }
 }
