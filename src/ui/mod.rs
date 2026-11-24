@@ -16,6 +16,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::acp::{PermissionRequest, SessionSummary};
+use crate::background::BackgroundTask;
 use crate::input::{AtomKind, AtomSpan, InputEditor};
 use crate::linebreak;
 use crate::theme;
@@ -40,6 +41,7 @@ use sidebar::{SidebarData, SidebarHits};
 pub enum HoverTarget {
     #[default]
     None,
+    SidebarBackground(u64),
     SidebarJump(u64),
     SidebarSession(String),
     SidebarContext,
@@ -217,6 +219,7 @@ pub struct ViewState<'a> {
     pub tick: usize,
     pub started_at: Instant,
     pub toast: Option<(&'a str, bool)>,
+    pub background_tasks: &'a [BackgroundTask],
     pub recent_sessions: &'a [SessionSummary],
     pub slash_menu: &'a [SlashSuggestion],
     pub slash_selected: usize,
@@ -416,6 +419,8 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
                 mode_label: view.mode_label,
                 tier: view.tier,
                 current_user_entry,
+                background_tasks: view.background_tasks,
+                started_at: view.started_at,
                 recent_sessions: view.recent_sessions,
                 hover: view.hover,
             },
@@ -849,14 +854,20 @@ fn draw_pulse_line(
         return Rect::default();
     }
     if view.busy {
-        let elapsed = view
+        let mut detail = view
             .transcript
             .turn_started
             .map(|s| activity::format_elapsed(s.elapsed()))
             .unwrap_or_default();
+        if !view.background_tasks.is_empty() {
+            if !detail.is_empty() {
+                detail.push_str(" · ");
+            }
+            detail.push_str(&format!("后台 {}", view.background_tasks.len()));
+        }
         let anim_frame = activity::frame_at(view.started_at.elapsed());
         let label = activity::infer_work_status(view.transcript);
-        let status_line = activity::render_status_line(label, &elapsed, anim_frame);
+        let status_line = activity::render_status_line(label, &detail, anim_frame);
 
         let btn_hovered = matches!(view.hover, HoverTarget::BottomButton);
         let (right_line, right_w, btn_hit) = if scrolled_up {
@@ -899,10 +910,8 @@ fn draw_pulse_line(
         }
         return btn_hit;
     }
-    if let Some((msg, is_err)) = view.toast {
-        let style = if is_err { theme::error() } else { theme::good() };
-        frame.render_widget(Paragraph::new(Line::styled(msg, style)), area);
-    }
+    let mut btn_hit = Rect::default();
+    let mut right_reserved = 0u16;
     if scrolled_up {
         let label = " ↓ 回到底部 (End) ";
         let style = if matches!(view.hover, HoverTarget::BottomButton) {
@@ -913,9 +922,76 @@ fn draw_pulse_line(
         let hint = Line::styled(label, style).right_aligned();
         frame.render_widget(Paragraph::new(hint), area);
         let btn_w = u16::try_from(label.width()).unwrap_or(0).min(area.width);
-        return Rect::new(area.right().saturating_sub(btn_w), area.y, btn_w, 1);
+        btn_hit = Rect::new(area.right().saturating_sub(btn_w), area.y, btn_w, 1);
+        right_reserved = btn_w.saturating_add(1);
     }
-    Rect::default()
+
+    let left_w = area.width.saturating_sub(right_reserved);
+    if left_w > 0 {
+        let left_area = Rect::new(area.x, area.y, left_w, 1);
+        if let Some((msg, is_err)) = view.toast {
+            let style = if is_err { theme::error() } else { theme::good() };
+            frame.render_widget(
+                Paragraph::new(Line::styled(linebreak::clip(msg, left_w), style)),
+                left_area,
+            );
+        } else if !view.background_tasks.is_empty() {
+            let line = render_background_badge_line(
+                view.background_tasks,
+                view.started_at.elapsed(),
+                left_w,
+            );
+            frame.render_widget(Paragraph::new(line), left_area);
+        }
+    }
+    btn_hit
+}
+
+/// 构造空闲态状态行左侧的紧凑后台任务运行标记（如 `◐ 后台任务 1 · sleep 6 · 12s`）。
+///
+/// 参数:
+/// - `tasks`: 当前运行中的后台任务列表
+/// - `app_elapsed`: 应用启动至今时长（用于驱动 250ms 旋转指示符）
+/// - `max_w`: 左侧可用列宽
+///
+/// 返回:
+/// - 适配宽度后的单行 `Line`
+fn render_background_badge_line(
+    tasks: &[BackgroundTask],
+    app_elapsed: std::time::Duration,
+    max_w: u16,
+) -> Line<'static> {
+    const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    let spin = SPINNER[((app_elapsed.as_millis() / 250) as usize) % SPINNER.len()];
+    let count = tasks.len();
+    let head_badge = format!("{spin} 后台任务 {count}");
+    let Some(first) = tasks.first() else {
+        return Line::styled(linebreak::clip(&head_badge, max_w), theme::accent());
+    };
+    let elapsed = activity::format_elapsed(first.elapsed());
+    let suffix = if count > 1 {
+        format!(" 等 · {elapsed}")
+    } else {
+        format!(" · {elapsed}")
+    };
+    let head_w = head_badge.width();
+    let suffix_w = suffix.width();
+    let room = usize::from(max_w);
+
+    // 1. 宽度充足时展示「旋转点 + 数量 + 首项任务摘要 + 耗时」
+    if room > head_w + suffix_w + 6 {
+        let summary_room = (room - head_w - suffix_w - 3) as u16;
+        let summary = linebreak::clip(&first.label, summary_room);
+        return Line::from(vec![
+            Span::styled(head_badge, theme::accent()),
+            Span::styled(" · ", theme::faint()),
+            Span::styled(summary, theme::dim()),
+            Span::styled(suffix, theme::faint()),
+        ]);
+    }
+    // 2. 窄屏回退为「旋转点 + 数量 + 耗时」
+    let compact = format!("{head_badge} · {elapsed}");
+    Line::styled(linebreak::clip(&compact, max_w), theme::accent())
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, view: &ViewState<'_>, show_cwd: bool) -> Rect {
@@ -927,6 +1003,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, view: &ViewState<'_>, show_cwd: bo
     if !view.mode_label.is_empty() {
         left_spans.push(Span::styled(" · ", theme::faint()));
         left_spans.push(Span::styled(view.mode_label.to_string(), theme::dim()));
+    }
+    if !view.background_tasks.is_empty() {
+        left_spans.push(Span::styled(" · ", theme::faint()));
+        left_spans.push(Span::styled(
+            format!("后台 {}", view.background_tasks.len()),
+            theme::accent(),
+        ));
     }
     let left_w: usize = left_spans.iter().map(|s| s.content.width()).sum();
     frame.render_widget(Paragraph::new(Line::from(left_spans)), area);
@@ -1546,6 +1629,175 @@ mod tests {
         assert!(
             !rev_picked.is_empty() && !rev_picked.contains('┃') && !rev_picked.contains('│'),
             "reverse drag from right margin must exclude decorative bars:\n{rev_picked}"
+        );
+    }
+
+    #[test]
+    fn background_task_badge_appears_after_turn_finishes_and_clears_on_completion() {
+        use crate::acp::{AcpEvent, SessionUpdate};
+
+        theme::init(ThemePreset::MiyuLavender, true);
+        let mut app = App::new(None, "/tmp/demo".into(), None, true, true);
+        app.connecting = false;
+        app.busy = true;
+
+        // 1. 收到一个长时间运行工具调用，回合结束时仍处于 in_progress
+        app.handle_acp_event(AcpEvent::Update {
+            session_id: "demo-8a9f2c11".into(),
+            update: SessionUpdate::ToolCall {
+                call_id: "call_bg_1".into(),
+                name: "run_command".into(),
+                title: "sleep 10 && echo BG_OK".into(),
+                kind: "execute".into(),
+                status: "in_progress".into(),
+                raw_input: Some(serde_json::json!({
+                    "CommandLine": "sleep 10 && echo BG_OK",
+                    "IsDaemon": false
+                })),
+                output: None,
+                diffs: Vec::new(),
+            },
+        });
+        app.handle_acp_event(AcpEvent::PromptFinished {
+            stop_reason: "end_turn".into(),
+            usage: None,
+        });
+        assert!(!app.busy);
+        assert!(app.has_background_tasks());
+
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        let screen_text: String = app
+            .last_hits
+            .screen_lines
+            .iter()
+            .map(|row| {
+                let mut line = String::new();
+                let mut skip_until = 0u16;
+                for (x, sym) in row {
+                    if *x < skip_until {
+                        continue;
+                    }
+                    let w = u16::try_from(sym.width()).unwrap_or(1).max(1);
+                    line.push_str(sym);
+                    skip_until = *x + w;
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen_text.contains("后台任务 1"),
+            "idle pulse line should show running background task badge:\n{screen_text}"
+        );
+        assert!(
+            screen_text.contains("后台 1"),
+            "footer should show compact background count:\n{screen_text}"
+        );
+        assert_eq!(
+            app.last_hits.sidebar.bg_rows.len(),
+            1,
+            "sidebar should expose clickable row for running background task"
+        );
+
+        // 2. 收到后台完成通知后标记自动清除
+        app.handle_acp_event(AcpEvent::Update {
+            session_id: "demo-8a9f2c11".into(),
+            update: SessionUpdate::ToolCallUpdate {
+                call_id: "call_bg_1".into(),
+                name: None,
+                title: None,
+                kind: None,
+                status: Some("completed".into()),
+                raw_input: None,
+                output: Some("BG_OK".into()),
+                diffs: Vec::new(),
+            },
+        });
+        assert!(!app.has_background_tasks());
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(app.last_hits.sidebar.bg_rows.is_empty());
+    }
+
+    #[test]
+    fn async_followup_keeps_pulse_animation_and_emits_turn_done_line() {
+        use std::time::{Duration, Instant};
+
+        use crate::acp::{AcpEvent, SessionUpdate};
+
+        theme::init(ThemePreset::MiyuLavender, true);
+        let mut app = App::new(None, "/tmp/demo".into(), None, true, true);
+        app.connecting = false;
+        app.busy = false;
+
+        // 1. 回合已空闲时收到服务端异步续答消息：自动进入生成动效活跃态并渲染底行流光
+        app.handle_acp_event(AcpEvent::Update {
+            session_id: "demo-8a9f2c11".into(),
+            update: SessionUpdate::AgentMessageChunk("后台任务已完成，结果正常。".into()),
+        });
+        assert!(app.is_generating());
+
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let active_view = buffer_to_text(terminal.backend().buffer(), 140, 40);
+        assert!(
+            active_view.contains('‿') && active_view.contains("正在生成"),
+            "async follow-up should display bottom pulse animation:\n{active_view}"
+        );
+
+        // 2. 收到末尾 usage_update 并静默超时后自动收尾，落盘 ▣ 轮次结束行并退出活跃态
+        app.handle_acp_event(AcpEvent::Update {
+            session_id: "demo-8a9f2c11".into(),
+            update: SessionUpdate::Usage {
+                used: 20_000,
+                size: 1_000_000,
+            },
+        });
+        app.async_turn_last_event = Some(Instant::now() - Duration::from_secs(1));
+        assert!(app.tick_timers());
+        assert!(!app.is_generating());
+
+        let last = app.transcript.entries.last().expect("has assistant entry");
+        assert!(
+            matches!(&last.kind, crate::transcript::EntryKind::Assistant { done_line: Some(m) } if m.starts_with('▣')),
+            "async follow-up must emit ▣ turn completion line"
+        );
+    }
+
+    #[test]
+    fn finish_turn_emits_done_line_even_when_turn_ends_with_tool_call() {
+        use crate::acp::{AcpEvent, SessionUpdate};
+
+        theme::init(ThemePreset::MiyuLavender, true);
+        let mut app = App::new(None, "/tmp/demo".into(), None, true, true);
+        app.connecting = false;
+        app.busy = true;
+        app.transcript.push_user("检查构建".into(), Vec::new());
+        app.handle_acp_event(AcpEvent::Update {
+            session_id: "demo-8a9f2c11".into(),
+            update: SessionUpdate::ToolCall {
+                call_id: "c_only_tool".into(),
+                name: "run_command".into(),
+                title: "cargo check".into(),
+                kind: "execute".into(),
+                status: "completed".into(),
+                raw_input: None,
+                output: Some("ok".into()),
+                diffs: Vec::new(),
+            },
+        });
+        app.handle_acp_event(AcpEvent::PromptFinished {
+            stop_reason: "end_turn".into(),
+            usage: None,
+        });
+
+        let last = app.transcript.entries.last().expect("has done line entry");
+        assert!(
+            matches!(&last.kind, crate::transcript::EntryKind::Assistant { done_line: Some(m) } if m.starts_with('▣')),
+            "tool-only turn must still emit ▣ turn completion line"
         );
     }
 }

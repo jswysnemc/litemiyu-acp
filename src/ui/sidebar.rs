@@ -1,6 +1,8 @@
 //! 右侧边栏（参考 LiteMiyu `ui/sidebar.rs`）：
 //! 会话信息、工作区、上下文进度条、用量统计、跳转消息、最近会话。
 
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -10,16 +12,22 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::acp::SessionSummary;
+use crate::background::BackgroundTask;
 use crate::linebreak;
 use crate::theme;
 use crate::transcript::{Transcript, format_short, short_id};
 use crate::ui::HoverTarget;
+use crate::ui::activity;
 use crate::ui::overlay::format_compact_time;
+
+/// 后台任务旋转指示符（4 帧顺时针几何圆点，避免 Emoji）。
+const BG_SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
 
 #[derive(Default, Debug, Clone)]
 pub struct SidebarHits {
     pub area: Rect,
     pub context_area: Rect,
+    pub bg_rows: Vec<(u16, u64)>,         // (screen_y, entry_id)
     pub jump_rows: Vec<(u16, u64)>,       // (screen_y, entry_id)
     pub session_rows: Vec<(u16, String)>, // (screen_y, session_id)
 }
@@ -30,6 +38,8 @@ pub struct SidebarData<'a> {
     pub mode_label: &'a str,
     pub tier: Option<&'a str>,
     pub current_user_entry: Option<u64>,
+    pub background_tasks: &'a [BackgroundTask],
+    pub started_at: Instant,
     pub recent_sessions: &'a [SessionSummary],
     pub hover: &'a HoverTarget,
 }
@@ -60,6 +70,7 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
     );
     let w = inner.width;
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut bg_marks: Vec<(usize, u64)> = Vec::new();
     let mut jump_marks: Vec<(usize, u64)> = Vec::new();
     let mut session_marks: Vec<(usize, String)> = Vec::new();
 
@@ -87,9 +98,73 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
         lines.push(Line::styled(format!("  {part}"), theme::dim()));
     }
 
+    // 2.5 后台运行任务（仅存在运行中后台任务时紧凑展示，点击定位对应工具行）
+    let hover_bg = theme::palette().row_focus_bg;
+    if !data.background_tasks.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled("后台任务", theme::side_title()),
+            Span::styled(
+                format!(" ({})", data.background_tasks.len()),
+                theme::accent(),
+            ),
+        ]));
+        let spin_idx = ((data.started_at.elapsed().as_millis() / 250) as usize) % BG_SPINNER.len();
+        let spinner = BG_SPINNER[spin_idx];
+        let content_room = usize::from(w.saturating_sub(2));
+        for task in data.background_tasks.iter().take(3) {
+            let row_idx = lines.len();
+            bg_marks.push((row_idx, task.entry_id));
+            let is_hover =
+                matches!(data.hover, HoverTarget::SidebarBackground(id) if *id == task.entry_id);
+            let row_bg = if is_hover {
+                Style::new().bg(hover_bg)
+            } else {
+                Style::new()
+            };
+            let lead = Span::styled(format!("{spinner} "), theme::accent().patch(row_bg));
+            let text_style = if is_hover {
+                theme::text().add_modifier(Modifier::BOLD).patch(row_bg)
+            } else {
+                theme::text()
+            };
+            let elapsed_str = activity::format_elapsed(task.elapsed());
+            let elapsed_w = elapsed_str.width();
+            let elapsed_style = if is_hover {
+                theme::dim().patch(row_bg)
+            } else {
+                theme::faint()
+            };
+            let spans = if content_room > elapsed_w + 6 {
+                let title_room = (content_room - elapsed_w - 1) as u16;
+                let clipped = linebreak::clip(&task.label, title_room);
+                let pad = content_room
+                    .saturating_sub(clipped.width() + elapsed_w)
+                    .max(1);
+                vec![
+                    lead,
+                    Span::styled(clipped, text_style),
+                    Span::styled(" ".repeat(pad), row_bg),
+                    Span::styled(elapsed_str, elapsed_style),
+                ]
+            } else {
+                vec![
+                    lead,
+                    Span::styled(linebreak::clip(&task.label, w.saturating_sub(2)), text_style),
+                ]
+            };
+            lines.push(pad_hover_line(spans, w, is_hover, hover_bg));
+        }
+        if data.background_tasks.len() > 3 {
+            lines.push(Line::styled(
+                format!("  +{} 项后台运行中", data.background_tasks.len() - 3),
+                theme::faint(),
+            ));
+        }
+    }
+
     // 3. 上下文（整段可点击查看状态/触发压缩）
     let mut context_rows: Option<(usize, usize)> = None;
-    let hover_bg = theme::palette().row_focus_bg;
     if data.transcript.context_window > 0 {
         lines.push(Line::default());
         let ctx_start = lines.len();
@@ -287,6 +362,11 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
                 inner.width,
                 (shown_end - start) as u16,
             );
+        }
+    }
+    for (row_idx, eid) in bg_marks {
+        if row_idx < max_h {
+            hits.bg_rows.push((inner.y + row_idx as u16, eid));
         }
     }
     for (row_idx, eid) in jump_marks {

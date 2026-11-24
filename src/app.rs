@@ -9,6 +9,7 @@ use crate::acp::{
     AcpClient, AcpCommand, AcpEvent, ConfigOption, ImagePayload, ModeInfo, PermissionRequest,
     SessionSummary, SessionUpdate, SlashCommandInfo, ToolDiff,
 };
+use crate::background::BackgroundTracker;
 use crate::clipboard::{self, ClipboardContent, LoadedImage};
 use crate::input::{AtomKind, InputEditor};
 use crate::paste::{WindowsPasteOutcome, WindowsPasteState};
@@ -117,7 +118,10 @@ pub struct App {
     pub available_commands: Vec<SlashCommandInfo>,
     pub recent_sessions: Vec<SessionSummary>,
     pub pending_resume: Option<String>,
+    pub background: BackgroundTracker,
     pub busy: bool,
+    pub async_turn_last_event: Option<Instant>,
+    pub async_turn_saw_usage: bool,
     pub connecting: bool,
     pub scroll: usize,
     pub auto_follow: bool,
@@ -175,7 +179,10 @@ impl App {
             available_commands: Vec::new(),
             recent_sessions: Vec::new(),
             pending_resume,
+            background: BackgroundTracker::default(),
             busy: false,
+            async_turn_last_event: None,
+            async_turn_saw_usage: false,
             connecting: !demo,
             scroll: 0,
             auto_follow: true,
@@ -318,6 +325,94 @@ impl App {
         self.toast = Some((msg.into(), is_error, Instant::now()));
     }
 
+    /// 判断当前会话是否存在正在运行的后台任务（供主循环驱动轻量刷新节拍）。
+    ///
+    /// 返回:
+    /// - 有后台任务运行时返回 `true`
+    pub fn has_background_tasks(&self) -> bool {
+        self.background.has_running()
+    }
+
+    /// 判断当前是否处于生成动效活跃态（包含前台回合与后台任务唤醒后的异步续答）。
+    ///
+    /// 返回:
+    /// - 需要显示底行流光状态行并按 32ms 节拍刷新时返回 `true`
+    pub fn is_generating(&self) -> bool {
+        self.busy || self.async_turn_last_event.is_some()
+    }
+
+    /// 推进应用内定时状态：清理已过期的 Toast，以及在异步续答静默结束后自动补全轮次结束行。
+    ///
+    /// 返回:
+    /// - 状态发生变化（需要重绘一帧）时返回 `true`
+    pub fn tick_timers(&mut self) -> bool {
+        let mut changed = false;
+        // 1. 清理超时 3 秒的 Toast，确保清除后空闲循环零空转
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, _, at)| at.elapsed() >= Duration::from_secs(3))
+        {
+            self.toast = None;
+            changed = true;
+        }
+        // 2. 服务端异步续答无 PromptFinished，静默超时且无前台工具时自动收尾补全 ▣ 结束行
+        if let Some(last_ev) = self.async_turn_last_event
+            && !self.busy
+            && !self.background.has_foreground_tool()
+        {
+            let idle_limit = if self.async_turn_saw_usage {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_millis(1500)
+            };
+            if last_ev.elapsed() >= idle_limit {
+                self.finish_async_turn();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// 标记服务端在 `busy == false` 期间主动推送了异步续答内容，启用底行流光动效并启动静默收尾计时。
+    fn mark_async_turn_activity(&mut self) {
+        if self.busy || self.connecting {
+            return;
+        }
+        if self.async_turn_last_event.is_none() {
+            self.transcript.turn_started = Some(Instant::now());
+            // 若当前展示的是非错误提示（如“后台任务已完成”），让位于实时流光状态行
+            if self.toast.as_ref().is_some_and(|(_, is_err, _)| !*is_err) {
+                self.toast = None;
+            }
+        }
+        self.async_turn_last_event = Some(Instant::now());
+        self.async_turn_saw_usage = false;
+    }
+
+    /// 结束当前异步续答回合，闭合未结束的思考块并写入 `▣` 轮次结束行。
+    fn finish_async_turn(&mut self) {
+        if self.async_turn_last_event.take().is_none() {
+            return;
+        }
+        self.async_turn_saw_usage = false;
+        let label = self.turn_done_model_label();
+        self.transcript.finish_turn(&label, "end_turn", None);
+    }
+
+    /// 组合写入轮次结束行 `▣` 的模型与思考等级标签。
+    ///
+    /// 返回:
+    /// - 格式化后的模型标签字符串
+    fn turn_done_model_label(&self) -> String {
+        let mut label = self.model_label();
+        let effort = self.effort_label();
+        if !effort.is_empty() {
+            label.push_str(&format!(" ({effort})"));
+        }
+        label
+    }
+
     pub fn model_label(&self) -> String {
         if let Some(opt) = self
             .config_options
@@ -422,6 +517,7 @@ impl App {
             .iter()
             .filter(|img| self.editor.text().contains(&img.label))
             .count();
+        let background_tasks = self.background.running_tasks();
         let view = ViewState {
             transcript: &self.transcript,
             editor: &self.editor,
@@ -431,7 +527,7 @@ impl App {
             effort_label: &effort,
             mode_label: &mode,
             tier: self.tier.as_deref(),
-            busy: self.busy,
+            busy: self.is_generating(),
             connecting: self.connecting,
             scroll: self.scroll,
             auto_follow: self.auto_follow,
@@ -439,6 +535,7 @@ impl App {
             tick: self.tick,
             started_at: self.started_at,
             toast,
+            background_tasks: &background_tasks,
             recent_sessions: &self.recent_sessions,
             slash_menu: &slash_menu,
             slash_selected: self.slash_selected,
@@ -497,6 +594,10 @@ impl App {
                 is_load,
             } => {
                 self.connecting = false;
+                // 历史回放完成后重置后台任务与异步续答状态，避免将旧会话记录误判为运行中
+                self.background.clear();
+                self.async_turn_last_event = None;
+                self.async_turn_saw_usage = false;
                 self.transcript.session_id = Some(session_id.clone());
                 if !config_options.is_empty() {
                     self.config_options = config_options;
@@ -530,18 +631,30 @@ impl App {
                 self.recent_sessions = list;
                 self.refresh_resume_picker_items();
             }
-            AcpEvent::Update { update, .. } => self.handle_session_update(update),
+            AcpEvent::Update { session_id, update } => {
+                // 忽略已切换会话后来自旧会话的迟到推送，避免串会话污染状态与动效
+                if !self.connecting
+                    && !session_id.is_empty()
+                    && self
+                        .transcript
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|cur| cur != session_id)
+                {
+                    return;
+                }
+                self.handle_session_update(update);
+            }
             AcpEvent::PermissionRequested(req) => {
                 self.permission = Some((req, 0));
             }
             AcpEvent::PromptFinished { stop_reason, usage } => {
                 self.busy = false;
+                self.async_turn_last_event = None;
+                self.async_turn_saw_usage = false;
                 self.permission = None;
-                let mut label = self.model_label();
-                let effort = self.effort_label();
-                if !effort.is_empty() {
-                    label.push_str(&format!(" ({effort})"));
-                }
+                self.background.on_prompt_finished(&stop_reason);
+                let label = self.turn_done_model_label();
                 self.transcript
                     .finish_turn(&label, &stop_reason, usage.as_ref());
             }
@@ -565,6 +678,9 @@ impl App {
             AcpEvent::Disconnected(reason) => {
                 self.connecting = false;
                 self.busy = false;
+                self.async_turn_last_event = None;
+                self.async_turn_saw_usage = false;
+                self.background.clear();
                 self.transcript.push_notice(reason.clone(), true);
                 self.toast(reason, true);
             }
@@ -577,9 +693,18 @@ impl App {
                 self.transcript.append_user_chunk(&text);
             }
             SessionUpdate::AgentThoughtChunk(text) => {
+                if !text.is_empty() {
+                    self.mark_async_turn_activity();
+                }
                 self.transcript.append_thought(&text);
             }
             SessionUpdate::AgentMessageChunk(text) => {
+                if !text.is_empty() {
+                    self.mark_async_turn_activity();
+                }
+                if !self.connecting {
+                    self.background.on_agent_message_chunk(&text);
+                }
                 self.transcript.append_assistant(&text);
             }
             SessionUpdate::ToolCall {
@@ -592,16 +717,42 @@ impl App {
                 output,
                 diffs,
             } => {
-                self.transcript.upsert_tool(
-                    call_id,
-                    Some(name),
-                    Some(title),
-                    Some(kind),
-                    Some(status),
-                    raw_input,
+                let is_active = !matches!(
+                    status.trim().to_ascii_lowercase().as_str(),
+                    "completed" | "failed" | "error" | "cancelled" | "canceled" | "done" | "succeeded"
+                );
+                if is_active {
+                    self.mark_async_turn_activity();
+                }
+                let entry_id = self.transcript.upsert_tool(
+                    call_id.clone(),
+                    Some(name.clone()),
+                    Some(title.clone()),
+                    Some(kind.clone()),
+                    Some(status.clone()),
+                    raw_input.clone(),
                     output,
                     diffs,
                 );
+                if !self.connecting
+                    && let Some(done) = self.background.on_tool_event(
+                        &call_id,
+                        entry_id,
+                        Some(&name),
+                        Some(&title),
+                        Some(&kind),
+                        Some(&status),
+                        raw_input.as_ref(),
+                    )
+                    && !self.busy
+                {
+                    let msg = if done.failed {
+                        format!("后台任务失败：{}", done.label)
+                    } else {
+                        format!("后台任务已完成：{}", done.label)
+                    };
+                    self.toast(msg, done.failed);
+                }
             }
             SessionUpdate::ToolCallUpdate {
                 call_id,
@@ -613,11 +764,49 @@ impl App {
                 output,
                 diffs,
             } => {
-                self.transcript.upsert_tool(
-                    call_id, name, title, kind, status, raw_input, output, diffs,
+                let is_terminal = status.as_deref().is_some_and(|st| {
+                    matches!(
+                        st.trim().to_ascii_lowercase().as_str(),
+                        "completed" | "failed" | "error" | "cancelled" | "canceled" | "done" | "succeeded"
+                    )
+                });
+                if !is_terminal {
+                    self.mark_async_turn_activity();
+                }
+                let entry_id = self.transcript.upsert_tool(
+                    call_id.clone(),
+                    name.clone(),
+                    title.clone(),
+                    kind.clone(),
+                    status.clone(),
+                    raw_input.clone(),
+                    output,
+                    diffs,
                 );
+                if !self.connecting
+                    && let Some(done) = self.background.on_tool_event(
+                        &call_id,
+                        entry_id,
+                        name.as_deref(),
+                        title.as_deref(),
+                        kind.as_deref(),
+                        status.as_deref(),
+                        raw_input.as_ref(),
+                    )
+                    && !self.busy
+                {
+                    let msg = if done.failed {
+                        format!("后台任务失败：{}", done.label)
+                    } else {
+                        format!("后台任务已完成：{}", done.label)
+                    };
+                    self.toast(msg, done.failed);
+                }
             }
             SessionUpdate::Plan(items) => {
+                if !items.is_empty() {
+                    self.mark_async_turn_activity();
+                }
                 self.transcript.update_plan(items);
             }
             SessionUpdate::AvailableCommands(cmds) => {
@@ -640,6 +829,9 @@ impl App {
                 self.transcript.context_used = used;
                 if size > 0 {
                     self.transcript.context_window = size;
+                }
+                if self.async_turn_last_event.is_some() {
+                    self.async_turn_saw_usage = true;
                 }
             }
         }
@@ -1225,9 +1417,12 @@ impl App {
         if rect_contains(self.last_hits.usage_cell, col, row) {
             return HoverTarget::UsageCell;
         }
-        // 2. 右侧边栏紧凑交互项（上下文进度区、跳转消息、最近会话）
+        // 2. 右侧边栏紧凑交互项（后台任务、上下文进度区、跳转消息、最近会话）
         let side = &self.last_hits.sidebar;
         if side.area.width > 0 && col >= side.area.x && col < side.area.right() {
+            if let Some((_, eid)) = side.bg_rows.iter().find(|(y, _)| *y == row) {
+                return HoverTarget::SidebarBackground(*eid);
+            }
             if rect_contains(side.context_area, col, row) {
                 return HoverTarget::SidebarContext;
             }
@@ -1317,11 +1512,24 @@ impl App {
             return;
         }
 
-        // 1. 点击侧边栏跳转消息 / 切换最近会话
+        // 1. 点击侧边栏后台任务 / 跳转消息 / 切换最近会话
         if self.last_hits.sidebar.area.width > 0
             && col >= self.last_hits.sidebar.area.x
             && col < self.last_hits.sidebar.area.right()
         {
+            if let Some((_, eid)) = self
+                .last_hits
+                .sidebar
+                .bg_rows
+                .iter()
+                .find(|(y, _)| *y == row)
+            {
+                if let Some(&target_row) = self.last_hits.entry_starts.get(eid) {
+                    self.auto_follow = false;
+                    self.scroll = target_row;
+                }
+                return;
+            }
             if let Some((_, eid)) = self
                 .last_hits
                 .sidebar
@@ -1569,6 +1777,8 @@ impl App {
             })
             .collect();
 
+        // 若上一轮服务端异步续答尚未静默收尾，先补齐 ▣ 结束行再开启新回合
+        self.finish_async_turn();
         self.transcript.push_user(display_text, chips);
         self.transcript.turn_started = Some(Instant::now());
         self.busy = true;
@@ -2023,9 +2233,12 @@ impl App {
 
     fn start_new_session(&mut self) {
         self.transcript.clear();
+        self.background.clear();
         self.pending_images.clear();
         self.image_seq = 0;
         self.busy = false;
+        self.async_turn_last_event = None;
+        self.async_turn_saw_usage = false;
         self.connecting = true;
         self.auto_follow = true;
         self.scroll = 0;
@@ -2048,6 +2261,9 @@ impl App {
             .map(|s| s.cwd.clone())
             .unwrap_or_else(|| self.cwd.clone());
         self.transcript.clear();
+        self.background.clear();
+        self.async_turn_last_event = None;
+        self.async_turn_saw_usage = false;
         self.pending_images.clear();
         self.image_seq = 0;
         self.cwd = target_cwd.clone();

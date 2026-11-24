@@ -192,7 +192,7 @@ impl Transcript {
         raw_input: Option<Value>,
         output: Option<String>,
         diffs: Vec<ToolDiff>,
-    ) {
+    ) -> u64 {
         self.finish_open_thoughts();
         for e in self.entries.iter_mut().rev() {
             if let EntryKind::Tool {
@@ -229,7 +229,7 @@ impl Transcript {
                     if !diffs.is_empty() {
                         *existing_diffs = diffs;
                     }
-                    return;
+                    return e.id;
                 }
             }
         }
@@ -252,6 +252,7 @@ impl Transcript {
                 expanded: false,
             },
         });
+        id
     }
 
     pub fn update_plan(&mut self, items: Vec<PlanItem>) {
@@ -316,14 +317,36 @@ impl Transcript {
         }
         let meta = format!("▣ {}", parts.join(" · "));
 
+        // 1. 末条为未关闭的助手回答时直接附着轮次结束行
         if let Some(last) = self.entries.last_mut() {
-            if let EntryKind::Assistant { done_line } = &mut last.kind {
+            if let EntryKind::Assistant { done_line } = &mut last.kind
+                && done_line.is_none()
+            {
                 *done_line = Some(meta);
                 return;
             }
         }
-        if stop_reason == "cancelled" {
-            self.push_notice(meta, false);
+        // 2. 本轮以工具/计划/思考结尾或被中断时，追加独立的轮次结束行，避免 ▣ 汇总丢失
+        let has_turn_output = self
+            .entries
+            .iter()
+            .rev()
+            .take_while(|e| !matches!(e.kind, EntryKind::User { .. }))
+            .any(|e| {
+                !matches!(
+                    &e.kind,
+                    EntryKind::Assistant { done_line: Some(_) } if e.text.trim().is_empty()
+                )
+            });
+        if has_turn_output || stop_reason == "cancelled" {
+            let id = self.alloc_id();
+            self.entries.push(Entry {
+                id,
+                text: String::new(),
+                kind: EntryKind::Assistant {
+                    done_line: Some(meta),
+                },
+            });
         }
     }
 

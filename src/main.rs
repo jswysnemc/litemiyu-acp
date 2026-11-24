@@ -3,6 +3,7 @@
 
 mod acp;
 mod app;
+mod background;
 mod clipboard;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod clipboard_unix;
@@ -186,6 +187,7 @@ async fn run_loop(
     event_rx: &mut mpsc::UnboundedReceiver<AcpEvent>,
 ) -> Result<()> {
     let mut last_tick = std::time::Instant::now();
+    let mut last_bg_draw = std::time::Instant::now();
     let mut dirty = true;
 
     loop {
@@ -219,10 +221,20 @@ async fn run_loop(
             dirty = true;
         }
 
-        // 仅在有状态变化、动效进行中或存在定时消失的 Toast 时重绘，空闲零空转
-        if dirty || app.busy || app.connecting || app.toast.is_some() {
+        if app.tick_timers() {
+            dirty = true;
+        }
+
+        // 仅在有状态变化、动效进行中或存在后台任务节拍时重绘，空闲零空转
+        let animating = app.is_generating() || app.connecting;
+        let bg_tick_due = app.has_background_tasks()
+            && last_bg_draw.elapsed() >= Duration::from_millis(250);
+        if dirty || animating || bg_tick_due {
             draw_frame(terminal, app)?;
             dirty = false;
+            if bg_tick_due {
+                last_bg_draw = std::time::Instant::now();
+            }
         }
 
         if app.should_quit {
@@ -230,7 +242,7 @@ async fn run_loop(
         }
 
         // 轮询终端输入（动效期 32ms，空闲期 25ms 保证低延迟响应且空闲不重绘）
-        let timeout = if app.busy || app.connecting {
+        let timeout = if animating {
             Duration::from_millis(32)
         } else {
             Duration::from_millis(25)
