@@ -20,7 +20,7 @@ impl App {
                 };
                 if let Some(client) = &self.client {
                     client.send(AcpCommand::ListSessions { cwd: None });
-                    if let Some(sid) = self.pending_resume.take() {
+                    if let Some(sid) = self.pending_resume.clone() {
                         client.send(AcpCommand::LoadSession {
                             session_id: sid,
                             cwd: self.cwd.clone(),
@@ -43,6 +43,7 @@ impl App {
             } => {
                 self.connecting = false;
                 // 历史回放完成后重置后台任务与异步续答状态，避免将旧会话记录误判为运行中
+                self.pending_resume = None;
                 self.background.clear();
                 self.async_turn_last_event = None;
                 self.async_turn_saw_usage = false;
@@ -81,14 +82,13 @@ impl App {
             }
             AcpEvent::Update { session_id, update } => {
                 // 忽略已切换会话后来自旧会话的迟到推送，避免串会话污染状态与动效
-                if !self.connecting
-                    && !session_id.is_empty()
-                    && self
-                        .transcript
-                        .session_id
-                        .as_deref()
-                        .is_some_and(|cur| cur != session_id)
-                {
+                let current = self.transcript.session_id.as_deref();
+                let stale = if self.connecting {
+                    self.pending_resume.as_deref().map_or(current == Some(session_id.as_str()), |target| target != session_id)
+                } else {
+                    current.is_some_and(|active| active != session_id)
+                };
+                if !session_id.is_empty() && stale {
                     return;
                 }
                 self.handle_session_update(update);
@@ -96,15 +96,18 @@ impl App {
             AcpEvent::PermissionRequested(req) => {
                 self.permission = Some((req, 0));
             }
-            AcpEvent::PromptFinished { stop_reason, usage } => {
-                self.busy = false;
-                self.async_turn_last_event = None;
-                self.async_turn_saw_usage = false;
-                self.permission = None;
-                self.background.on_prompt_finished(&stop_reason);
-                let label = self.turn_done_model_label();
-                self.transcript
-                    .finish_turn(&label, &stop_reason, usage.as_ref());
+            AcpEvent::ElicitationRequested(req) => {
+                self.elicitation = Some(super::ElicitationState::new(req));
+            }
+            AcpEvent::PromptFinished {
+                prompt_id,
+                stop_reason,
+                usage,
+            } => {
+                self.handle_prompt_finished(prompt_id, stop_reason, usage);
+            }
+            AcpEvent::PromptRejected { prompt_id, message } => {
+                self.handle_prompt_rejected(prompt_id, message);
             }
             AcpEvent::ConfigUpdated(opts) => {
                 if !opts.is_empty() {
@@ -125,10 +128,14 @@ impl App {
             }
             AcpEvent::Disconnected(reason) => {
                 self.connecting = false;
+                self.in_flight_prompts.clear();
                 self.busy = false;
                 self.async_turn_last_event = None;
                 self.async_turn_saw_usage = false;
+                self.permission = None;
+                self.elicitation = None;
                 self.background.clear();
+                self.subagents.clear();
                 self.transcript.push_notice(reason.clone(), true);
                 self.toast(reason, true);
             }
@@ -182,6 +189,7 @@ impl App {
                     output,
                     diffs,
                 );
+                if let Some(snapshot) = self.transcript.tool_snapshot(&call_id) { self.subagents.update(snapshot); }
                 if !self.connecting
                     && let Some(done) = self.background.on_tool_event(
                         &call_id,
@@ -231,6 +239,7 @@ impl App {
                     output,
                     diffs,
                 );
+                if let Some(snapshot) = self.transcript.tool_snapshot(&call_id) { self.subagents.update(snapshot); }
                 if !self.connecting
                     && let Some(done) = self.background.on_tool_event(
                         &call_id,

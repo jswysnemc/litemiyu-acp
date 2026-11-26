@@ -21,8 +21,8 @@ use crate::theme;
 pub const DIFF_FOLD_HEAD_LINES: usize = 8;
 /// 折叠态保留的 diff 尾部行数（与 `sai` 对齐）。
 pub const DIFF_FOLD_TAIL_LINES: usize = 8;
-/// 展开态单文件最大视觉行保护上限，避免超大生成文件卡顿终端。
-const DIFF_EXPANDED_MAX_VISUAL_LINES: usize = 600;
+/// 展开态单文件默认最大视觉行保护上限，避免超大生成文件卡顿终端。
+pub const DIFF_EXPANDED_MAX_VISUAL_LINES: usize = 600;
 
 /// 公共部分（前缀 + 后缀）占比低于该百分比时放弃行内高亮（整行重写无需行内噪声）。
 const MIN_COMMON_PERCENT: usize = 25;
@@ -114,12 +114,42 @@ pub fn compute(old_text: &str, new_text: &str) -> ComputedDiff {
 }
 
 /// 将计算好的 diff 渲染为 `sai` 风格带语法高亮 + 行内差异强调 + 首尾折叠的 `Span` 行。
-/// 返回 `(渲染行列表, 展开态因保护上限额外省略的视觉行数)`。
+///
+/// 参数:
+/// - `diff`: 已计算的统一差分结果
+/// - `path`: 文件路径（用于推导语法高亮语言）
+/// - `width`: 可用终端列宽
+/// - `expanded`: 是否处于展开态
+///
+/// 返回:
+/// - `(渲染行列表, 展开态因保护上限额外省略的视觉行数)`
+#[cfg(test)]
 pub fn render_lines(
     diff: &ComputedDiff,
     path: &str,
     width: u16,
     expanded: bool,
+) -> (Vec<Vec<Span<'static>>>, usize) {
+    render_lines_with_cap(diff, path, width, expanded, DIFF_EXPANDED_MAX_VISUAL_LINES)
+}
+
+/// 按自定义展开行数上限渲染 Diff（供折叠条渐进展开 10 行或全部展开使用）。
+///
+/// 参数:
+/// - `diff`: 已计算的统一差分结果
+/// - `path`: 文件路径
+/// - `width`: 可用终端列宽
+/// - `expanded`: 是否处于展开态
+/// - `expanded_visual_cap`: 展开态最大可见视觉行数上限
+///
+/// 返回:
+/// - `(渲染行列表, 超出上限被省略的视觉行数)`
+pub fn render_lines_with_cap(
+    diff: &ComputedDiff,
+    path: &str,
+    width: u16,
+    expanded: bool,
+    expanded_visual_cap: usize,
 ) -> (Vec<Vec<Span<'static>>>, usize) {
     let p = theme::palette();
     // 对齐 `sai`：行号列至少 3 字符宽，右侧留 1 列对称内收
@@ -157,7 +187,7 @@ pub fn render_lines(
     let mut visual_emitted = 0usize;
     let mut overflow_omitted = 0usize;
     let visual_cap = if expanded {
-        DIFF_EXPANDED_MAX_VISUAL_LINES
+        expanded_visual_cap
     } else {
         usize::MAX
     };

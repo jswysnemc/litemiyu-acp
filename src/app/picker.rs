@@ -11,7 +11,7 @@ use crate::ui::overlay::{
     same_directory,
 };
 
-use super::App;
+use super::{App, QueuedMode};
 
 impl App {
     pub(super) fn handle_permission_key(&mut self, key: KeyEvent) {
@@ -88,13 +88,19 @@ impl App {
             KeyCode::PageUp => picker.page_up(5),
             KeyCode::PageDown => picker.page_down(5),
             KeyCode::Backspace
-                if !matches!(picker.kind, PickerKind::Help | PickerKind::Status) =>
+                if !matches!(
+                    picker.kind,
+                    PickerKind::Help | PickerKind::Status | PickerKind::Queue
+                ) =>
             {
                 picker.query.pop();
                 picker.selected = 0;
             }
             KeyCode::Char(c)
-                if !matches!(picker.kind, PickerKind::Help | PickerKind::Status)
+                if !matches!(
+                    picker.kind,
+                    PickerKind::Help | PickerKind::Status | PickerKind::Queue
+                )
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
@@ -146,6 +152,25 @@ impl App {
                     }
                 }
                 "model" => self.open_config_picker("model", "选择模型", PickerKind::Model),
+                _ => {}
+            },
+            PickerKind::Queue => match item.id.as_str() {
+                "mode:queue" => self.set_queued_mode(QueuedMode::Queue),
+                "mode:steer" => self.set_queued_mode(QueuedMode::SendImmediately),
+                "send_next" => {
+                    if !self.send_queued_head_immediately() {
+                        self.toast("当前待发队列为空", false);
+                    }
+                }
+                "recall_last" => {
+                    if !self.recall_last_queued_to_editor() {
+                        self.toast("当前待发队列为空", false);
+                    }
+                }
+                "clear" => {
+                    let cleared = self.clear_queued_messages();
+                    self.toast(format!("已清空 {cleared} 条待发队列消息"), false);
+                }
                 _ => {}
             },
             PickerKind::Help => {}
@@ -360,6 +385,8 @@ impl App {
     pub(super) fn open_help_picker(&mut self) {
         let rows = [
             ("Enter / Shift+Enter", "发送消息 / 输入换行（亦支持 Ctrl+J、Alt+Enter）"),
+            ("Ctrl+S / ↑(空输入框)", "运行中立即并发插话发送（或发出队首） / 撤回排队消息到输入框"),
+            ("/queue [queue|steer]", "切换生成期消息策略（排队等待 / 即时插话）或管理待发队列"),
             ("Ctrl+A / Ctrl+E", "光标移至输入框最开头 / 最末尾（Home/End 移至当前行首尾）"),
             ("Ctrl+G (Alt+G)", "用 $EDITOR / notepad.exe 打开输入框正文，保存退出后替换"),
             ("Ctrl+V / Alt+V / 拖拽", "粘贴截图/图片或大段文本（自动折叠为原子块，退格一键删除）"),
@@ -371,7 +398,7 @@ impl App {
             ("Esc", "中断当前生成 / 关闭浮层 / 清空输入框"),
             ("/model · /effort · /mode", "交互式切换模型、思考等级、执行模式"),
             ("/resume · /new", "按当前目录/全部与最近时间搜索恢复会话（Tab 切换范围）"),
-            ("/theme · /bg", "切换 5 套 MD3/TokyoNight 配色 / 开关透明背景"),
+            ("/theme · /bg", "切换 6 套 MD3/TokyoNight/暖纸浅色配色 / 开关透明背景"),
             ("/copy [n|all] · /mouse", "复制回答原文 / 开关鼠标捕获；直接左键拖选松手自动复制"),
             ("鼠标拖拽 / 点击", "左键拖选正文或侧边栏松手即复制（不串栏）；点击展开或开链接"),
         ];

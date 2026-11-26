@@ -496,6 +496,7 @@ fn background_task_badge_appears_after_turn_finishes_and_clears_on_completion() 
         },
     });
     app.handle_acp_event(AcpEvent::PromptFinished {
+        prompt_id: 0,
         stop_reason: "end_turn".into(),
         usage: None,
     });
@@ -613,6 +614,7 @@ fn finish_turn_emits_done_line_even_when_turn_ends_with_tool_call() {
         },
     });
     app.handle_acp_event(AcpEvent::PromptFinished {
+        prompt_id: 0,
         stop_reason: "end_turn".into(),
         usage: None,
     });

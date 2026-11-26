@@ -8,17 +8,19 @@ use crate::acp::ToolDiff;
 use crate::diff;
 use crate::linebreak;
 use crate::theme;
+use crate::transcript::{FoldSection, Transcript};
 
 use super::tool_meta::{
     build_read_preview, clip_highlighted_shell, extract_command_text, extract_read_path,
     file_basename, is_read_tool_call, push_detail_lines, push_highlighted_command_lines,
     push_read_preview_rows, read_header_range_badge,
 };
-use super::{MdCache, RenderRow, RowCopyMeta, SPINNER};
+use super::{fold, MdCache, RenderRow, RowAction, RowCopyMeta, SPINNER};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_tool(
     entry_id: u64,
+    transcript: &Transcript,
     name: &str,
     title: &str,
     kind: &str,
@@ -44,6 +46,7 @@ pub(super) fn build_tool(
         "execute" => "执行",
         "search" => "搜索",
         "fetch" => "网络",
+        _ if name.eq_ignore_ascii_case("ask_question") => "提问",
         _ => name,
     };
     let clean_title = title.replace('\n', " ");
@@ -157,7 +160,7 @@ pub(super) fn build_tool(
         entry_id,
         spans: header_spans,
         links: Vec::new(),
-        clickable_entry: has_detail,
+        action: if has_detail { RowAction::Toggle } else { RowAction::None },
         copy_meta: RowCopyMeta::default(),
     });
 
@@ -166,6 +169,8 @@ pub(super) fn build_tool(
     }
 
     let inner_w = usize::from(width.saturating_sub(2)).max(1);
+    let limit = |section, base| transcript.fold_reveal(entry_id, section).effective_limit(base);
+    let output_limit = |base| (FoldSection::ToolOutput, limit(FoldSection::ToolOutput, base));
 
     // 1. 若有结构化 Diff，展开后展示 `sai` 风格语法高亮 + 行内差异强调 Diff
     if !computed_diffs.is_empty() {
@@ -176,7 +181,7 @@ pub(super) fn build_tool(
                     entry_id,
                     spans: Vec::new(),
                     links: Vec::new(),
-                    clickable_entry: true,
+                    action: RowAction::Toggle,
                     copy_meta: RowCopyMeta::default(),
                 });
             }
@@ -198,7 +203,7 @@ pub(super) fn build_tool(
                     entry_id,
                     spans: sub,
                     links: vec![(3, 3 + path_w, td.path.clone())],
-                    clickable_entry: true,
+                    action: RowAction::Toggle,
                     copy_meta: RowCopyMeta::default(),
                 });
             }
@@ -210,37 +215,30 @@ pub(super) fn build_tool(
                         Span::styled("(无文本变更)", theme::faint()),
                     ],
                     links: Vec::new(),
-                    clickable_entry: true,
+                    action: RowAction::Toggle,
                     copy_meta: RowCopyMeta::default(),
                 });
             } else {
-                let (diff_lines, omitted) = diff::render_lines(computed, &td.path, width, true);
+                let section = FoldSection::ToolDiff(idx);
+                let cap = limit(section, diff::DIFF_EXPANDED_MAX_VISUAL_LINES);
+                let (diff_lines, omitted) = diff::render_lines_with_cap(computed, &td.path, width, true, cap);
                 for spans in diff_lines {
                     out.push(RenderRow {
                         entry_id,
                         spans,
                         links: Vec::new(),
-                        clickable_entry: true,
+                        action: RowAction::Toggle,
                         copy_meta: RowCopyMeta::default(),
                     });
                 }
                 if omitted > 0 {
-                    out.push(RenderRow {
-                        entry_id,
-                        spans: vec![
-                            Span::raw(" "),
-                            Span::styled(format!("⋮ 已截断剩余 {omitted} 行 diff"), theme::faint()),
-                        ],
-                        links: Vec::new(),
-                        clickable_entry: true,
-                        copy_meta: RowCopyMeta::default(),
-                    });
+                    out.push(fold::marker(entry_id, section, omitted));
                 }
             }
         }
         let trimmed_out = output.trim();
         if !trimmed_out.is_empty() {
-            push_detail_lines(entry_id, trimmed_out, theme::dim(), inner_w, 12, out);
+            push_detail_lines(entry_id, trimmed_out, theme::dim(), inner_w, output_limit(12), out);
         }
         return;
     }
@@ -258,14 +256,14 @@ pub(super) fn build_tool(
                     Span::styled(path_shown, theme::md_url()),
                 ],
                 links: vec![(3, 3 + path_w, path_str.to_string())],
-                clickable_entry: true,
+                action: RowAction::Toggle,
                 copy_meta: RowCopyMeta::default(),
             });
         }
         if let Some(preview) = build_read_preview(output, path_str, raw_input) {
-            push_read_preview_rows(entry_id, &preview, width, 160, out);
+            push_read_preview_rows(entry_id, &preview, width, limit(FoldSection::ToolReadPreview, 160), out);
         } else if !output.trim().is_empty() {
-            push_detail_lines(entry_id, output.trim(), theme::dim(), inner_w, 40, out);
+            push_detail_lines(entry_id, output.trim(), theme::dim(), inner_w, output_limit(40), out);
         } else {
             out.push(RenderRow {
                 entry_id,
@@ -274,7 +272,7 @@ pub(super) fn build_tool(
                     Span::styled("(无预览内容)", theme::faint()),
                 ],
                 links: Vec::new(),
-                clickable_entry: true,
+                action: RowAction::Toggle,
                 copy_meta: RowCopyMeta::default(),
             });
         }
@@ -283,16 +281,17 @@ pub(super) fn build_tool(
 
     // 3. 普通工具（命令执行、搜索等）
     if let Some(cmd) = exec_command {
-        push_highlighted_command_lines(entry_id, &cmd, inner_w, 8, out);
+        push_highlighted_command_lines(entry_id, &cmd, inner_w, limit(FoldSection::ToolCommand, 8), out);
     } else if let Some(input) = raw_input
         && let Some(path) = input["Path"]
             .as_str()
             .or_else(|| input["path"].as_str())
         {
-            push_detail_lines(entry_id, path, theme::md_url(), inner_w, 2, out);
+            let section = FoldSection::ToolPath;
+            push_detail_lines(entry_id, path, theme::md_url(), inner_w, (section, limit(section, 2)), out);
         }
     let trimmed_out = output.trim();
     if !trimmed_out.is_empty() {
-        push_detail_lines(entry_id, trimmed_out, theme::dim(), inner_w, 24, out);
+        push_detail_lines(entry_id, trimmed_out, theme::dim(), inner_w, output_limit(24), out);
     }
 }

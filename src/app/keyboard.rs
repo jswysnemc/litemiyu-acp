@@ -25,10 +25,15 @@ impl App {
             return;
         }
 
-        // 1. 权限审批抽屉优先
+        // 1. 权限审批抽屉与代理提问表单优先
         if self.permission.is_some() {
             self.windows_paste.reset();
             self.handle_permission_key(key);
+            return;
+        }
+        if self.elicitation.is_some() {
+            self.windows_paste.reset();
+            self.handle_elicitation_key(key);
             return;
         }
 
@@ -139,6 +144,18 @@ impl App {
                     },
                     false,
                 );
+                return;
+            }
+            (KeyCode::Char('s' | 'S'), KeyModifiers::CONTROL) => {
+                self.windows_paste.reset();
+                self.completion_dismissed_text = None;
+                self.completion_selected = 0;
+                let (_raw, expanded) = self.editor.take_and_record();
+                if !expanded.trim().is_empty() || !self.pending_images.is_empty() {
+                    self.submit_message(expanded, true);
+                } else if !self.send_queued_head_immediately() {
+                    self.toast("输入框与待发队列均为空", false);
+                }
                 return;
             }
             (KeyCode::BackTab, _) => {
@@ -335,6 +352,12 @@ impl App {
             }
             (KeyCode::Up, _) => {
                 if !self.editor.move_up(input_w) {
+                    if self.editor.is_empty()
+                        && self.pending_images.is_empty()
+                        && self.recall_last_queued_to_editor()
+                    {
+                        return;
+                    }
                     self.editor.history_prev();
                 }
             }

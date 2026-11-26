@@ -51,6 +51,7 @@ pub enum PickerKind {
     Model,
     Effort,
     Mode,
+    Queue,
     Resume,
     Theme,
     Status,
@@ -310,8 +311,11 @@ pub fn draw_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
         return;
     }
 
-    // 搜索栏（Help / Status 不需要搜索栏）
-    let no_search = matches!(picker.kind, PickerKind::Help | PickerKind::Status);
+    // 搜索栏（Help / Status / Queue 不需要搜索栏）
+    let no_search = matches!(
+        picker.kind,
+        PickerKind::Help | PickerKind::Status | PickerKind::Queue
+    );
     let list_area = if !no_search {
         let search_line = if picker.query.is_empty() {
             Line::from(vec![

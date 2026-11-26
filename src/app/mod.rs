@@ -1,11 +1,17 @@
 //! 应用核心状态机：整合 ACP 异步事件、键盘/鼠标交互、斜杠命令与用户偏好持久化。
 
 mod commands;
+mod elicitation;
 mod events;
 mod keyboard;
 mod mouse;
 mod picker;
+mod queue;
 
+pub use elicitation::ElicitationState;
+pub use queue::{InFlightPrompt, QueuedMessage, QueuedMode};
+
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -33,6 +39,8 @@ pub struct UserPrefs {
     pub paint_bg: bool,
     #[serde(default = "default_true")]
     pub show_sidebar: bool,
+    #[serde(default)]
+    pub queued_mode: QueuedMode,
 }
 
 fn default_theme_id() -> String {
@@ -49,6 +57,7 @@ impl Default for UserPrefs {
             theme: default_theme_id(),
             paint_bg: true,
             show_sidebar: true,
+            queued_mode: QueuedMode::default(),
         }
     }
 }
@@ -89,6 +98,7 @@ const LOCAL_COMMANDS: &[(&str, &str)] = &[
     ("model", "切换模型"),
     ("effort", "切换思考等级 (low/medium/high/xhigh)"),
     ("mode", "切换执行模式 (default/accept-edits/plan)"),
+    ("queue", "切换排队等待 / 即时插话模式或管理待发队列"),
     ("resume", "浏览并恢复历史会话"),
     ("new", "开启新会话"),
     ("clear", "清空并开启新会话"),
@@ -102,6 +112,7 @@ const LOCAL_COMMANDS: &[(&str, &str)] = &[
     ("quit", "退出 litemiyu-acp"),
 ];
 
+#[derive(Debug, Clone)]
 pub struct PendingImage {
     pub label: String,
     pub image: LoadedImage,
@@ -122,7 +133,12 @@ pub struct App {
     pub recent_sessions: Vec<SessionSummary>,
     pub pending_resume: Option<String>,
     pub background: BackgroundTracker,
+    pub subagents: crate::subagent::Tracker,
     pub busy: bool,
+    pub queued_mode: QueuedMode,
+    pub queued_messages: VecDeque<QueuedMessage>,
+    pub in_flight_prompts: Vec<InFlightPrompt>,
+    pub next_prompt_id: u64,
     pub async_turn_last_event: Option<Instant>,
     pub async_turn_saw_usage: bool,
     pub connecting: bool,
@@ -148,6 +164,7 @@ pub struct App {
     pub dragging_scrollbar: bool,
     pub picker: Option<PickerState>,
     pub permission: Option<(PermissionRequest, usize)>,
+    pub elicitation: Option<ElicitationState>,
     pub last_ctrl_c: Option<Instant>,
     pub should_quit: bool,
     pub md_cache: MdCache,
@@ -185,7 +202,12 @@ impl App {
             recent_sessions: Vec::new(),
             pending_resume,
             background: BackgroundTracker::default(),
+            subagents: Default::default(),
             busy: false,
+            queued_mode: QueuedMode::default(),
+            queued_messages: VecDeque::new(),
+            in_flight_prompts: Vec::new(),
+            next_prompt_id: 1,
             async_turn_last_event: None,
             async_turn_saw_usage: false,
             connecting: !demo,
@@ -211,6 +233,7 @@ impl App {
             dragging_scrollbar: false,
             picker: None,
             permission: None,
+            elicitation: None,
             last_ctrl_c: None,
             should_quit: false,
             md_cache: MdCache::new(),
@@ -322,7 +345,7 @@ impl App {
              \x20       onFinish = { 1f }, // 补齐终态，避免冷订阅漏收\n\
              \x20   )\n\
              ```\n\n\
-             > 注：点击上方 `◇ 思考` 或 `✓ 读取` 可原地展开细节；输入 `/theme` 可实时切换 5 套配色主题。",
+             > 注：点击上方 `◇ 思考` 或 `✓ 读取` 可原地展开细节；输入 `/theme` 可实时切换 6 套配色主题。",
         );
         self.transcript
             .finish_turn("Gemini 4 Neon · High", "end_turn", None);
@@ -337,7 +360,7 @@ impl App {
     /// 返回:
     /// - 有后台任务运行时返回 `true`
     pub fn has_background_tasks(&self) -> bool {
-        self.background.has_running()
+        self.background.has_running() || (!self.connecting && self.subagents.watching())
     }
 
     /// 判断当前是否处于生成动效活跃态（包含前台回合与后台任务唤醒后的异步续答）。
@@ -383,7 +406,7 @@ impl App {
     /// 返回:
     /// - 状态发生变化（需要重绘一帧）时返回 `true`
     pub fn tick_timers(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = !self.connecting && self.subagents.poll(self.transcript.session_id.as_deref());
         // 1. 清理超时 3 秒的 Toast，确保清除后空闲循环零空转
         if self
             .toast
@@ -417,7 +440,7 @@ impl App {
             return;
         }
         if self.async_turn_last_event.is_none() {
-            self.transcript.turn_started = Some(Instant::now());
+            self.transcript.begin_turn();
             // 若当前展示的是非错误提示（如“后台任务已完成”），让位于实时流光状态行
             if self.toast.as_ref().is_some_and(|(_, is_err, _)| !*is_err) {
                 self.toast = None;
@@ -435,6 +458,7 @@ impl App {
         self.async_turn_saw_usage = false;
         let label = self.turn_done_model_label();
         self.transcript.finish_turn(&label, "end_turn", None);
+        self.flush_next_queued_message();
     }
 
     /// 组合写入轮次结束行 `▣` 的模型与思考等级标签。
@@ -542,6 +566,7 @@ impl App {
             .filter(|img| self.editor.text().contains(&img.label))
             .count();
         let background_tasks = self.background.running_tasks();
+        let queued_head_preview = self.queued_messages.front().map(QueuedMessage::preview);
         let view = ViewState {
             transcript: &self.transcript,
             editor: &self.editor,
@@ -560,14 +585,19 @@ impl App {
             started_at: self.started_at,
             toast,
             background_tasks: &background_tasks,
+            subagents: &self.subagents.agents,
             recent_sessions: &self.recent_sessions,
             completion_menu: completion_menu.as_ref(),
             completion_selected: self.completion_selected,
             pending_images: active_pending_images,
+            queued_mode: self.queued_mode,
+            queued_count: self.queued_messages.len(),
+            queued_head_preview: queued_head_preview.as_deref(),
             selection: self.selection,
             hover: &self.hover,
             picker: self.picker.as_ref(),
             permission,
+            elicitation: self.elicitation.as_ref(),
         };
         let hits = crate::ui::draw(frame, &view, &mut self.md_cache);
         if self.auto_follow {
@@ -588,6 +618,7 @@ impl App {
             theme: theme::current_preset().id().to_string(),
             paint_bg: theme::paint_bg(),
             show_sidebar: self.show_sidebar,
+            queued_mode: self.queued_mode,
         };
         prefs.save();
     }

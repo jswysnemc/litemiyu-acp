@@ -28,6 +28,7 @@ pub struct SidebarHits {
     pub area: Rect,
     pub context_area: Rect,
     pub bg_rows: Vec<(u16, u64)>,         // (screen_y, entry_id)
+    pub subagent_rows: Vec<(u16, u64)>,
     pub jump_rows: Vec<(u16, u64)>,       // (screen_y, entry_id)
     pub session_rows: Vec<(u16, String)>, // (screen_y, session_id)
 }
@@ -39,6 +40,7 @@ pub struct SidebarData<'a> {
     pub tier: Option<&'a str>,
     pub current_user_entry: Option<u64>,
     pub background_tasks: &'a [BackgroundTask],
+    pub subagents: &'a [crate::subagent::Agent],
     pub started_at: Instant,
     pub recent_sessions: &'a [SessionSummary],
     pub hover: &'a HoverTarget,
@@ -71,6 +73,7 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
     let w = inner.width;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut bg_marks: Vec<(usize, u64)> = Vec::new();
+    let mut subagent_marks = Vec::new();
     let mut jump_marks: Vec<(usize, u64)> = Vec::new();
     let mut session_marks: Vec<(usize, String)> = Vec::new();
 
@@ -100,6 +103,19 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
 
     // 2.5 后台运行任务（仅存在运行中后台任务时紧凑展示，点击定位对应工具行）
     let hover_bg = theme::palette().row_focus_bg;
+    if !data.subagents.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::styled(format!("子代理 ({})", data.subagents.len()), theme::side_title()));
+        let mut recent: Vec<_> = data.subagents.iter().rev().collect();
+        recent.sort_by_key(|agent| matches!(agent.phase, crate::subagent::Phase::Completed | crate::subagent::Phase::Failed));
+        for agent in recent.into_iter().take(3) {
+            subagent_marks.push((lines.len(), agent.entry_id));
+            let hovered = *data.hover == HoverTarget::SidebarSubagent(agent.entry_id);
+            let label = format!("{} {}", agent.headline(), agent.elapsed_label());
+            let style = if hovered { theme::accent_bold().bg(hover_bg) } else { theme::dim() };
+            lines.push(pad_hover_line(vec![Span::styled(linebreak::clip(label.trim_end(), w), style)], w, hovered, hover_bg));
+        }
+    }
     if !data.background_tasks.is_empty() {
         lines.push(Line::default());
         lines.push(Line::from(vec![
@@ -353,6 +369,8 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
     }
 
     let max_h = usize::from(inner.height);
+    hits.subagent_rows.extend(subagent_marks.into_iter().filter(|(row, _)| *row < max_h)
+        .map(|(row, entry)| (inner.y + row as u16, entry)));
     if let Some((start, end)) = context_rows
         && start < max_h {
             let shown_end = end.min(max_h);

@@ -58,6 +58,60 @@ pub struct PermissionRequest {
     pub options: Vec<PermissionOption>,
 }
 
+/// Elicitation 表单单选/多选候选项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElicitationOption {
+    pub value: String,
+    pub label: String,
+    pub description: String,
+}
+
+/// Elicitation 表单字段类型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElicitationFieldKind {
+    SingleSelect(Vec<ElicitationOption>),
+    MultiSelect {
+        options: Vec<ElicitationOption>,
+        min_items: Option<usize>,
+        max_items: Option<usize>,
+    },
+    Text {
+        default: String,
+    },
+    Boolean {
+        default: bool,
+    },
+    Number {
+        integer: bool,
+        default: String,
+    },
+}
+
+/// 解析后的单个 Elicitation 提问/表单字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElicitationField {
+    pub key: String,
+    pub title: String,
+    pub description: String,
+    pub required: bool,
+    pub kind: ElicitationFieldKind,
+    /// `agy` 为带选项问题伴随生成的自由补充字段名（如 `q0_other`）。
+    pub other_key: Option<String>,
+    pub other_title: String,
+}
+
+/// 服务端发起的 `elicitation/create` 提问/表单交互请求。
+#[derive(Debug, Clone)]
+pub struct ElicitationRequest {
+    pub rpc_id: Value,
+    pub session_id: String,
+    pub elicitation_id: String,
+    pub mode: String,
+    pub message: String,
+    pub url: Option<String>,
+    pub fields: Vec<ElicitationField>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TurnUsage {
     pub input_tokens: u64,
@@ -135,6 +189,7 @@ pub enum AcpCommand {
         cwd: Option<String>,
     },
     Prompt {
+        prompt_id: u64,
         session_id: String,
         text: String,
         images: Vec<ImagePayload>,
@@ -154,6 +209,11 @@ pub enum AcpCommand {
     AnswerPermission {
         rpc_id: Value,
         option_id: Option<String>,
+    },
+    AnswerElicitation {
+        rpc_id: Value,
+        action: String,
+        content: Option<Value>,
     },
     Shutdown,
 }
@@ -179,9 +239,15 @@ pub enum AcpEvent {
         update: SessionUpdate,
     },
     PermissionRequested(PermissionRequest),
+    ElicitationRequested(ElicitationRequest),
     PromptFinished {
+        prompt_id: u64,
         stop_reason: String,
         usage: Option<TurnUsage>,
+    },
+    PromptRejected {
+        prompt_id: u64,
+        message: String,
     },
     ConfigUpdated(Vec<ConfigOption>),
     Error(String),

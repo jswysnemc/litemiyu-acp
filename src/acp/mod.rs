@@ -14,14 +14,16 @@ use tokio::sync::mpsc;
 
 pub use parse::decode_acp_cwd;
 pub use types::*;
-use parse::{extract_timestamp_field, parse_config_options, parse_session_update};
+use parse::{
+    extract_timestamp_field, parse_config_options, parse_elicitation_request, parse_session_update,
+};
 
 enum PendingKind {
     Initialize,
     NewSession,
     LoadSession { session_id: String },
     ListSessions,
-    Prompt,
+    Prompt { prompt_id: u64 },
     SetConfigOption,
     SetMode,
 }
@@ -105,7 +107,10 @@ impl AcpClient {
                             "readTextFile": true,
                             "writeTextFile": true
                         },
-                        "terminal": false
+                        "terminal": false,
+                        "elicitation": {
+                            "form": {}
+                        }
                     },
                     "clientInfo": {
                         "name": "litemiyu-acp",
@@ -175,10 +180,10 @@ impl AcpClient {
                                 });
                                 let _ = send_json(&mut writer, &req).await;
                             }
-                            AcpCommand::Prompt { session_id, text, images } => {
+                            AcpCommand::Prompt { prompt_id, session_id, text, images } => {
                                 let id = next_id;
                                 next_id += 1;
-                                pending.insert(id, PendingKind::Prompt);
+                                pending.insert(id, PendingKind::Prompt { prompt_id });
                                 let mut prompt_blocks: Vec<Value> = Vec::with_capacity(images.len() + 1);
                                 for img in images {
                                     prompt_blocks.push(json!({
@@ -252,6 +257,19 @@ impl AcpClient {
                                 });
                                 let _ = send_json(&mut writer, &resp).await;
                             }
+                            AcpCommand::AnswerElicitation { rpc_id, action, content } => {
+                                let mut result = serde_json::Map::new();
+                                result.insert("action".into(), Value::String(action));
+                                if let Some(c) = content {
+                                    result.insert("content".into(), c);
+                                }
+                                let resp = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": rpc_id,
+                                    "result": Value::Object(result)
+                                });
+                                let _ = send_json(&mut writer, &resp).await;
+                            }
                         }
                     }
                     line_res = reader.next_line() => {
@@ -291,6 +309,14 @@ impl AcpClient {
 
     pub fn send(&self, cmd: AcpCommand) {
         let _ = self.cmd_tx.send(cmd);
+    }
+
+    #[cfg(test)]
+    pub fn dummy_for_test(cmd_tx: mpsc::UnboundedSender<AcpCommand>) -> Self {
+        Self {
+            cmd_tx,
+            child_pid: None,
+        }
     }
 
     /// 优雅终止 ACP 后端及其独立进程组，避免退出客户端后残留后台孤儿进程。
@@ -373,12 +399,13 @@ async fn handle_incoming(
                     .as_str()
                     .unwrap_or("未知 RPC 错误")
                     .to_string();
-                let _ = event_tx.send(AcpEvent::Error(message));
-                if matches!(kind, PendingKind::Prompt) {
-                    let _ = event_tx.send(AcpEvent::PromptFinished {
-                        stop_reason: "error".into(),
-                        usage: None,
-                    });
+                match kind {
+                    PendingKind::Prompt { prompt_id } => {
+                        let _ = event_tx.send(AcpEvent::PromptRejected { prompt_id, message });
+                    }
+                    _ => {
+                        let _ = event_tx.send(AcpEvent::Error(message));
+                    }
                 }
                 return;
             }
@@ -438,7 +465,7 @@ async fn handle_incoming(
                         .unwrap_or_default();
                     let _ = event_tx.send(AcpEvent::SessionsListed(sessions));
                 }
-                PendingKind::Prompt => {
+                PendingKind::Prompt { prompt_id } => {
                     let stop_reason = result["stopReason"]
                         .as_str()
                         .unwrap_or("end_turn")
@@ -450,7 +477,11 @@ async fn handle_incoming(
                         thought_tokens: u["thoughtTokens"].as_u64().unwrap_or(0),
                         total_tokens: u["totalTokens"].as_u64().unwrap_or(0),
                     });
-                    let _ = event_tx.send(AcpEvent::PromptFinished { stop_reason, usage });
+                    let _ = event_tx.send(AcpEvent::PromptFinished {
+                        prompt_id,
+                        stop_reason,
+                        usage,
+                    });
                 }
                 PendingKind::SetConfigOption => {
                     let opts = parse_config_options(&result["configOptions"]);
@@ -560,6 +591,10 @@ async fn handle_server_request(
                 raw_input,
                 options,
             }));
+        }
+        "elicitation/create" => {
+            let req = parse_elicitation_request(req_id, params);
+            let _ = event_tx.send(AcpEvent::ElicitationRequested(req));
         }
         "fs/read_text_file" => {
             let path = params["path"].as_str().unwrap_or("");

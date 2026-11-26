@@ -19,6 +19,8 @@ pub enum ThemePreset {
     MiyuForest,
     /// 浅色护眼日间主题（Tokyo Night Day）
     MiyuDay,
+    /// 暖调纸质护眼浅色主题（暖杏底色与墨色高对比）
+    MiyuPaper,
     /// 透明继承宿主终端背景
     Terminal,
 }
@@ -29,6 +31,7 @@ impl ThemePreset {
         ThemePreset::MiyuNight,
         ThemePreset::MiyuForest,
         ThemePreset::MiyuDay,
+        ThemePreset::MiyuPaper,
         ThemePreset::Terminal,
     ];
 
@@ -38,6 +41,7 @@ impl ThemePreset {
             Self::MiyuNight => "miyu-night",
             Self::MiyuForest => "miyu-forest",
             Self::MiyuDay => "miyu-day",
+            Self::MiyuPaper => "miyu-paper",
             Self::Terminal => "terminal",
         }
     }
@@ -47,7 +51,8 @@ impl ThemePreset {
             Self::MiyuLavender => "Miyu Lavender (莫兰迪紫蓝·默认)",
             Self::MiyuNight => "Miyu Night (Tokyo Night 深色)",
             Self::MiyuForest => "Miyu Forest (MD3 鼠尾草暗色)",
-            Self::MiyuDay => "Miyu Day (柔和浅色)",
+            Self::MiyuDay => "Miyu Day (冷调清浅)",
+            Self::MiyuPaper => "Miyu Paper (暖调纸质浅色)",
             Self::Terminal => "Terminal (透明跟随终端)",
         }
     }
@@ -58,6 +63,7 @@ impl ThemePreset {
             "miyu-night" | "night" | "tokyonight" | "tokyo-night" | "dark" => Some(Self::MiyuNight),
             "miyu-forest" | "forest" | "green" => Some(Self::MiyuForest),
             "miyu-day" | "day" | "light" => Some(Self::MiyuDay),
+            "miyu-paper" | "paper" | "warm-light" | "cream" => Some(Self::MiyuPaper),
             "terminal" | "transparent" | "native" => Some(Self::Terminal),
             _ => None,
         }
@@ -206,6 +212,53 @@ const DAY: Palette = Palette {
     code_parameter: Color::Rgb(0x8c, 0x6c, 0x3e),
 };
 
+const PAPER: Palette = Palette {
+    background: Color::Rgb(0xf6, 0xf2, 0xea),
+    surface: Color::Rgb(0xed, 0xe7, 0xdb),
+    panel_bg: Color::Rgb(0xe4, 0xdc, 0xcb),
+    text: Color::Rgb(0x2b, 0x27, 0x23),
+    dim: Color::Rgb(0x6a, 0x62, 0x58),
+    faint: Color::Rgb(0x9c, 0x92, 0x84),
+    accent: Color::Rgb(0xa8, 0x48, 0x24),
+    picked: Color::Rgb(0x7c, 0x4d, 0x99),
+    on_accent: Color::Rgb(0xfa, 0xf7, 0xf2),
+    thought: Color::Rgb(0x2d, 0x6f, 0x73),
+    good: Color::Rgb(0x3f, 0x6f, 0x3c),
+    warn: Color::Rgb(0x9e, 0x65, 0x14),
+    error: Color::Rgb(0xb9, 0x32, 0x3f),
+    added: Color::Rgb(0x3f, 0x6f, 0x3c),
+    removed: Color::Rgb(0xb9, 0x32, 0x3f),
+    diff_added_bg: Color::Rgb(0xe1, 0xee, 0xdd),
+    diff_removed_bg: Color::Rgb(0xf5, 0xdf, 0xe0),
+    diff_added_emphasis_bg: Color::Rgb(0xbd, 0xdc, 0xb6),
+    diff_removed_emphasis_bg: Color::Rgb(0xea, 0xb7, 0xbc),
+    diff_gutter_fg: Color::Rgb(0x6e, 0x65, 0x5a),
+    md_bold: Color::Rgb(0x8f, 0x3f, 0x1b),
+    md_italic: Color::Rgb(0x6b, 0x5b, 0x4d),
+    md_code: Color::Rgb(0x25, 0x69, 0x6e),
+    md_code_bg: Color::Rgb(0xea, 0xe3, 0xd5),
+    md_link: Color::Rgb(0x2b, 0x61, 0x99),
+    md_url: Color::Rgb(0x3a, 0x6c, 0x9e),
+    md_image: Color::Rgb(0x7c, 0x4d, 0x99),
+    md_quote: Color::Rgb(0x6e, 0x64, 0x59),
+    md_table_head: Color::Rgb(0x8f, 0x3f, 0x1b),
+    md_heading: Color::Rgb(0x7c, 0x4d, 0x99),
+    md_math: Color::Rgb(0x2b, 0x61, 0x99),
+    side_title: Color::Rgb(0xa8, 0x48, 0x24),
+    row_focus_bg: Color::Rgb(0xdf, 0xd5, 0xc3),
+    code_keyword: Color::Rgb(0x7c, 0x4d, 0x99),
+    code_function: Color::Rgb(0x2b, 0x61, 0x99),
+    code_string: Color::Rgb(0x3f, 0x6f, 0x3c),
+    code_number: Color::Rgb(0xb0, 0x51, 0x1a),
+    code_comment: Color::Rgb(0x8b, 0x81, 0x75),
+    code_type: Color::Rgb(0x25, 0x69, 0x6e),
+    code_constant: Color::Rgb(0xb0, 0x51, 0x1a),
+    code_property: Color::Rgb(0x32, 0x6c, 0x62),
+    code_operator: Color::Rgb(0x5f, 0x57, 0x4e),
+    code_macro: Color::Rgb(0x9e, 0x44, 0x20),
+    code_parameter: Color::Rgb(0x8a, 0x5a, 0x18),
+};
+
 /// Material Design 3 衍生调色板（复刻 LiteMiyu `md3.rs`）：保留 Tokyo Night 的明暗对比层次，只柔和替换色相。
 fn md3_overlay(base: &Palette, seed: u32, dark: bool) -> Palette {
     let source = MdRgb::from_u32(seed);
@@ -286,6 +339,7 @@ fn build_palette(preset: ThemePreset, paint_bg: bool) -> Palette {
         ThemePreset::MiyuNight => NIGHT,
         ThemePreset::MiyuForest => md3_overlay(&NIGHT, 0x4ca87a, true),
         ThemePreset::MiyuDay => DAY,
+        ThemePreset::MiyuPaper => PAPER,
         ThemePreset::Terminal => {
             let mut t = md3_overlay(&NIGHT, 0x8b7cf6, true);
             t.background = Color::Reset;
@@ -325,9 +379,13 @@ pub fn init(preset: ThemePreset, paint_bg: bool) {
 
 pub fn set_preset(preset: ThemePreset) {
     let mut state = THEME.write().unwrap_or_else(PoisonError::into_inner);
+    let prev = state.preset;
     state.preset = preset;
+    // 1. 切入透明终端主题时自动关闭铺底色；从透明主题切回实体主题时恢复铺底色，避免深色终端下浅色主题文字失对比
     if preset == ThemePreset::Terminal {
         state.paint_bg = false;
+    } else if prev == ThemePreset::Terminal {
+        state.paint_bg = true;
     }
     state.palette = build_palette(state.preset, state.paint_bg);
 }
@@ -523,5 +581,23 @@ mod tests {
         assert_ne!(opaque_lavender.surface, Color::Reset);
         assert_ne!(opaque_lavender.panel_bg, Color::Reset);
         assert_ne!(opaque_lavender.md_code_bg, Color::Reset);
+    }
+
+    #[test]
+    fn miyu_paper_light_theme_parses_and_provides_warm_light_palette() {
+        assert_eq!(ThemePreset::parse("miyu-paper"), Some(ThemePreset::MiyuPaper));
+        assert_eq!(ThemePreset::parse("paper"), Some(ThemePreset::MiyuPaper));
+        assert_eq!(ThemePreset::parse("warm-light"), Some(ThemePreset::MiyuPaper));
+        assert_eq!(ThemePreset::MiyuPaper.id(), "miyu-paper");
+        assert!(ThemePreset::ALL.contains(&ThemePreset::MiyuPaper));
+
+        let p = build_palette(ThemePreset::MiyuPaper, true);
+        assert_eq!(p.background, Color::Rgb(0xf6, 0xf2, 0xea));
+        assert_eq!(p.text, Color::Rgb(0x2b, 0x27, 0x23));
+        assert_ne!(p.background, build_palette(ThemePreset::MiyuDay, true).background);
+
+        let transparent_paper = build_palette(ThemePreset::MiyuPaper, false);
+        assert_eq!(transparent_paper.background, Color::Reset);
+        assert_eq!(transparent_paper.md_code_bg, Color::Reset);
     }
 }

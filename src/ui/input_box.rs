@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
+use crate::app::QueuedMode;
 use crate::background::BackgroundTask;
 use crate::input::{AtomKind, AtomSpan, InputEditor};
 use crate::linebreak;
@@ -14,13 +15,22 @@ use crate::theme;
 
 use super::{HoverTarget, ViewState, activity, input_text_width};
 
+/// 输入框边框与占位文案所需的附加上下文状态。
+pub(super) struct InputBoxStatus<'a> {
+    pub pending_images: usize,
+    pub queued_mode: QueuedMode,
+    pub queued_count: usize,
+    pub queued_head_preview: Option<&'a str>,
+    pub busy: bool,
+}
+
 pub(super) fn draw_input_box(
     frame: &mut Frame,
     area: Rect,
     editor: &InputEditor,
     show_cursor: bool,
     is_home: bool,
-    pending_images: usize,
+    status: InputBoxStatus<'_>,
 ) -> Rect {
     let text_w = input_text_width(area.width);
     let visible_h = usize::from(area.height.saturating_sub(2));
@@ -42,21 +52,39 @@ pub(super) fn draw_input_box(
         .border_type(BorderType::Rounded)
         .border_style(theme::faint());
     if overflowing {
+        let label = if status.queued_count > 0 {
+            format!(" 第 {}/{total_lines} 行 · 队列 {} 条 ", cur_row + 1, status.queued_count)
+        } else {
+            format!(" 第 {}/{total_lines} 行 ", cur_row + 1)
+        };
+        block = block.title_top(Line::styled(label, theme::dim()).left_aligned());
+    } else if status.queued_count > 0 {
+        let preview_budget = area.width.saturating_sub(28).clamp(8, 36);
+        let head = status
+            .queued_head_preview
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(": {}", linebreak::clip(s, preview_budget)))
+            .unwrap_or_default();
         block = block.title_top(
             Line::styled(
-                format!(" 第 {}/{total_lines} 行 ", cur_row + 1),
-                theme::dim(),
+                format!(" 待发 {} 条{head} ", status.queued_count),
+                theme::accent(),
             )
             .left_aligned(),
         );
     }
-    if pending_images > 0 {
+
+    if status.pending_images > 0 {
         block = block.title_top(
             Line::styled(
-                format!(" 已附 {pending_images} 张图片 "),
+                format!(" 已附 {} 张图片 ", status.pending_images),
                 theme::md_image(),
             )
             .right_aligned(),
+        );
+    } else if status.queued_count > 1 && area.width >= 56 {
+        block = block.title_top(
+            Line::styled(" Ctrl+S 立即插话 · ↑ 撤回 ", theme::dim()).right_aligned(),
         );
     }
     let inner = block.inner(area);
@@ -82,6 +110,15 @@ pub(super) fn draw_input_box(
     if editor.is_empty() {
         let placeholder = if is_home {
             "/ 命令 · # Skill · @ 文件 · Ctrl+V 贴图 · 拖拽图片直传"
+        } else if status.queued_count > 0 {
+            "队列中有待发消息 · ↑ 撤回编辑 · Ctrl+S 立即插话 · /queue 管理"
+        } else if status.busy {
+            match status.queued_mode {
+                QueuedMode::SendImmediately => {
+                    "即时插话模式：Enter 直接并发发送 · /queue queue 切回排队"
+                }
+                QueuedMode::Queue => "生成中：Enter 加入待发队列 · Ctrl+S 立即并发插话 · Esc 中断",
+            }
         } else {
             "/ 命令 · # Skill · @ 文件 · Shift+Enter 换行 · Ctrl+O 展开细节"
         };
@@ -214,6 +251,8 @@ pub(super) fn draw_pulse_line(
         );
         return Rect::default();
     }
+    let active_agents = view.subagents.iter().filter(|agent| matches!(agent.phase,
+        crate::subagent::Phase::Launching | crate::subagent::Phase::Running)).count();
     if view.busy {
         let mut detail = view
             .transcript
@@ -225,6 +264,10 @@ pub(super) fn draw_pulse_line(
                 detail.push_str(" · ");
             }
             detail.push_str(&format!("后台 {}", view.background_tasks.len()));
+        }
+        if active_agents > 0 {
+            if !detail.is_empty() { detail.push_str(" · "); }
+            detail.push_str(&format!("子代理 {active_agents}"));
         }
         let anim_frame = activity::frame_at(view.started_at.elapsed());
         let label = activity::infer_work_status(view.transcript);
@@ -303,6 +346,8 @@ pub(super) fn draw_pulse_line(
                 left_w,
             );
             frame.render_widget(Paragraph::new(line), left_area);
+        } else if active_agents > 0 {
+            frame.render_widget(Paragraph::new(Line::styled(format!("子代理 {active_agents}"), theme::accent())), left_area);
         }
     }
     btn_hit
@@ -375,4 +420,77 @@ pub(super) fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, visibl
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use unicode_width::UnicodeWidthStr;
+
+    use crate::app::{App, QueuedMode};
+    use crate::theme::{self, ThemePreset};
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer, width: u16, height: u16) -> String {
+        let mut out = String::new();
+        for y in 0..height {
+            let mut x = 0;
+            while x < width {
+                let sym = buf[(x, y)].symbol();
+                out.push_str(sym);
+                x += u16::try_from(sym.width()).unwrap_or(1).max(1);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn queued_message_and_steer_mode_render_in_input_box_and_footer() {
+        theme::init(ThemePreset::MiyuLavender, true);
+        let mut app = App::new(None, "/tmp/demo".into(), None, false, true);
+        app.connecting = false;
+        app.transcript.session_id = Some("sess-1".into());
+        app.busy = true;
+        app.queued_mode = QueuedMode::Queue;
+        app.submit_text("后续再排查测试".into());
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let single_queued_screen = buffer_text(terminal.backend().buffer(), 100, 30);
+        assert!(
+            single_queued_screen.contains("待发 1 条: 后续再排查测试"),
+            "input border should show queued preview:\n{single_queued_screen}"
+        );
+        assert!(
+            !single_queued_screen.contains("Ctrl+S 立即插话 · ↑ 撤回"),
+            "single queued message should not show top-right hint:\n{single_queued_screen}"
+        );
+        assert!(
+            single_queued_screen.contains("队列 1"),
+            "footer should show queued count:\n{single_queued_screen}"
+        );
+
+        // 存在多条队列时，输入框右上角才展示快捷操作提示
+        app.submit_text("第二条排队消息".into());
+        terminal.draw(|f| app.render(f)).unwrap();
+        let multi_queued_screen = buffer_text(terminal.backend().buffer(), 100, 30);
+        assert!(
+            multi_queued_screen.contains("待发 2 条: 后续再排查测试"),
+            "input border should update queued count:\n{multi_queued_screen}"
+        );
+        assert!(
+            multi_queued_screen.contains("Ctrl+S 立即插话 · ↑ 撤回"),
+            "multiple queued messages should show top-right hint:\n{multi_queued_screen}"
+        );
+
+        app.queued_mode = QueuedMode::SendImmediately;
+        terminal.draw(|f| app.render(f)).unwrap();
+        let steer_screen = buffer_text(terminal.backend().buffer(), 100, 30);
+        assert!(
+            steer_screen.contains("即时插话"),
+            "footer should show steer mode badge:\n{steer_screen}"
+        );
+    }
 }

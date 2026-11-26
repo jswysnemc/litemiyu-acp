@@ -1,11 +1,26 @@
 //! 会话对话记录与格式化工具。
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use chrono::Local;
 use serde_json::Value;
 
 use crate::acp::{PlanItem, ToolDiff, TurnUsage};
+
+mod fold;
+pub use fold::{FoldReveal, FoldSection};
+
+/// 工具条目的合并状态快照（供子代理追踪器读取完整入参、输出与状态）。
+#[derive(Debug, Clone)]
+pub struct ToolSnapshot<'a> {
+    pub entry_id: u64,
+    pub name: &'a str,
+    pub title: &'a str,
+    pub status: &'a str,
+    pub raw_input: Option<&'a Value>,
+    pub output: &'a str,
+}
 
 #[derive(Debug, Clone)]
 pub struct ImageChip {
@@ -60,6 +75,9 @@ pub struct Transcript {
     pub total_output: u64,
     pub total_cached_read: u64,
     pub turn_started: Option<Instant>,
+    pub turn_first_token: Option<Instant>,
+    turn_stream_chunks: usize,
+    fold_reveals: HashMap<(u64, FoldSection), FoldReveal>,
     next_id: u64,
 }
 
@@ -75,6 +93,9 @@ impl Transcript {
             total_output: 0,
             total_cached_read: 0,
             turn_started: None,
+            turn_first_token: None,
+            turn_stream_chunks: 0,
+            fold_reveals: HashMap::new(),
             next_id: 1,
         }
     }
@@ -87,6 +108,24 @@ impl Transcript {
         self.total_output = 0;
         self.total_cached_read = 0;
         self.turn_started = None;
+        self.turn_first_token = None;
+        self.turn_stream_chunks = 0;
+        self.fold_reveals.clear();
+    }
+
+    /// 标记新回合开始，重置首字延迟与流式输出块计数。
+    pub fn begin_turn(&mut self) {
+        self.turn_started = Some(Instant::now());
+        self.turn_first_token = None;
+        self.turn_stream_chunks = 0;
+    }
+
+    /// 记录当前活跃回合首个模型输出到达时刻并累计流式输出块数。
+    fn note_turn_token(&mut self) {
+        if self.turn_started.is_some() {
+            self.turn_first_token.get_or_insert_with(Instant::now);
+            self.turn_stream_chunks = self.turn_stream_chunks.saturating_add(1);
+        }
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -128,6 +167,9 @@ impl Transcript {
     }
 
     pub fn append_thought(&mut self, chunk: &str) {
+        if !chunk.is_empty() {
+            self.note_turn_token();
+        }
         if let Some(last) = self.entries.last_mut()
             && let EntryKind::Thought { elapsed, .. } = &mut last.kind
                 && elapsed.is_none() {
@@ -158,6 +200,9 @@ impl Transcript {
     }
 
     pub fn append_assistant(&mut self, chunk: &str) {
+        if !chunk.is_empty() {
+            self.note_turn_token();
+        }
         self.finish_open_thoughts();
         if let Some(last) = self.entries.last_mut()
             && let EntryKind::Assistant { done_line } = &last.kind
@@ -225,6 +270,7 @@ impl Transcript {
         }
 
         let id = self.alloc_id();
+        self.note_turn_token();
         let name_val = name.unwrap_or_else(|| "tool".into());
         let title_val = title.unwrap_or_else(|| name_val.clone());
         self.entries.push(Entry {
@@ -270,11 +316,16 @@ impl Transcript {
 
     pub fn finish_turn(&mut self, model_label: &str, stop_reason: &str, usage: Option<&TurnUsage>) {
         self.finish_open_thoughts();
-        let elapsed = self
-            .turn_started
-            .take()
-            .map(|t| t.elapsed())
+        let finished_at = Instant::now();
+        let started = self.turn_started.take();
+        let first_token = self.turn_first_token.take();
+        let stream_chunks = std::mem::take(&mut self.turn_stream_chunks);
+        let elapsed = started
+            .map(|t| finished_at.saturating_duration_since(t))
             .unwrap_or_default();
+        let ttft = started
+            .zip(first_token)
+            .map(|(s, f)| f.saturating_duration_since(s));
 
         if let Some(u) = usage {
             self.total_input = self.total_input.saturating_add(u.input_tokens);
@@ -289,6 +340,34 @@ impl Transcript {
         }
         if elapsed.as_millis() > 0 {
             parts.push(format_duration(elapsed));
+        }
+        // 1. 首字延迟（TTFT）：过滤掉异步续答瞬时启动产生的 <1ms 伪零值
+        if let Some(latency) = ttft
+            && latency >= Duration::from_millis(1)
+        {
+            parts.push(format!("首字 {}", format_latency(latency)));
+        }
+        // 2. Token 生成速度：多流式块扣除首字等待时间，单块回退总耗时，避免分母过小失真
+        if let Some(u) = usage {
+            let gen_tokens = generated_tokens(u);
+            if gen_tokens > 0 {
+                let decode_dur = if stream_chunks >= 2 {
+                    let after_first = ttft
+                        .map(|t| elapsed.saturating_sub(t))
+                        .unwrap_or(elapsed);
+                    if after_first >= Duration::from_millis(50) {
+                        after_first
+                    } else {
+                        elapsed
+                    }
+                } else {
+                    elapsed
+                };
+                if decode_dur >= Duration::from_millis(50) {
+                    let tps = gen_tokens as f64 / decode_dur.as_secs_f64();
+                    parts.push(format_token_speed(tps));
+                }
+            }
         }
         if self.context_used > 0 {
             let mut ctx = format_short(self.context_used);
@@ -338,26 +417,98 @@ impl Transcript {
         }
     }
 
+    /// 显式设置思考或工具条目的展开状态（侧栏点击子代理自动展开时使用）。
+    ///
+    /// 参数:
+    /// - `id`: 时间线条目 ID
+    /// - `expand`: 目标展开状态
+    ///
+    /// 返回:
+    /// - 找到并更新目标条目时返回 `true`
+    pub fn set_entry_expanded(&mut self, id: u64, expand: bool) -> bool {
+        let mut matched = false;
+        for e in &mut self.entries {
+            if e.id == id {
+                match &mut e.kind {
+                    EntryKind::Thought { expanded, .. } | EntryKind::Tool { expanded, .. } => {
+                        *expanded = expand;
+                        matched = true;
+                    }
+                    _ => {}
+                }
+                break;
+            }
+        }
+        if matched && !expand {
+            self.reset_entry_reveals(id);
+        }
+        matched
+    }
+
+    /// 根据 ACP `call_id` 读取已合并的工具条目快照。
+    ///
+    /// 参数:
+    /// - `call_id`: ACP 工具调用唯一标识
+    ///
+    /// 返回:
+    /// - 找到匹配工具条目时返回 `Some(ToolSnapshot)`
+    pub fn tool_snapshot(&self, call_id: &str) -> Option<ToolSnapshot<'_>> {
+        for e in self.entries.iter().rev() {
+            if let EntryKind::Tool {
+                call_id: cid,
+                name,
+                title,
+                status,
+                raw_input,
+                output,
+                ..
+            } = &e.kind
+                && cid == call_id
+            {
+                return Some(ToolSnapshot {
+                    entry_id: e.id,
+                    name,
+                    title,
+                    status,
+                    raw_input: raw_input.as_ref(),
+                    output,
+                });
+            }
+        }
+        None
+    }
+
     pub fn toggle_entry(&mut self, id: u64) -> bool {
+        let partial_thought = self.fold_reveal(id, FoldSection::Thought).effective_limit(3) > 3;
+        let mut collapsed = false;
+        let mut matched = false;
         for e in &mut self.entries {
             if e.id == id {
                 match &mut e.kind {
                     EntryKind::Thought { expanded, .. } => {
-                        *expanded = !*expanded;
-                        return true;
+                        *expanded = !*expanded && !partial_thought;
+                        collapsed = !*expanded;
+                        matched = true;
+                        break;
                     }
                     EntryKind::Tool { expanded, .. } => {
                         *expanded = !*expanded;
-                        return true;
+                        collapsed = !*expanded;
+                        matched = true;
+                        break;
                     }
                     _ => {}
                 }
             }
         }
-        false
+        if collapsed {
+            self.reset_entry_reveals(id);
+        }
+        matched
     }
 
     pub fn toggle_all_details(&mut self, expand: bool) {
+        self.fold_reveals.clear();
         for e in &mut self.entries {
             match &mut e.kind {
                 EntryKind::Thought { expanded, .. } => *expanded = expand,
@@ -443,5 +594,106 @@ pub fn short_id(id: &str) -> String {
         id.to_string()
     } else {
         chars[..8].iter().collect()
+    }
+}
+
+/// 计算本轮模型实际生成的输出 Token 数（兼容 thoughtTokens 独立上报或已折入 outputTokens 的后端）。
+///
+/// 参数:
+/// - `u`: 本轮 ACP 结束响应返回的 `TurnUsage`
+///
+/// 返回:
+/// - 本轮生成的总输出 Token 数量
+fn generated_tokens(u: &TurnUsage) -> u64 {
+    if u.thought_tokens == 0 {
+        return u.output_tokens;
+    }
+    let sum_without_thought = u.input_tokens.saturating_add(u.output_tokens);
+    let sum_with_cached = sum_without_thought.saturating_add(u.cached_read_tokens);
+    if u.total_tokens > 0
+        && (u.total_tokens == sum_without_thought || u.total_tokens == sum_with_cached)
+    {
+        u.output_tokens
+    } else {
+        u.output_tokens.saturating_add(u.thought_tokens)
+    }
+}
+
+/// 格式化首字延迟（小于 1 秒用 `ms`，大于等于 1 秒复用 `format_duration`）。
+fn format_latency(d: Duration) -> String {
+    if d < Duration::from_secs(1) {
+        format!("{}ms", d.as_millis())
+    } else {
+        format_duration(d)
+    }
+}
+
+/// 格式化 Token 生成速度（`>= 100` 取整，其余保留 1 位小数）。
+fn format_token_speed(tps: f64) -> String {
+    if tps >= 100.0 {
+        format!("{tps:.0} tok/s")
+    } else {
+        format!("{tps:.1} tok/s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_turn_includes_ttft_and_token_speed() {
+        let mut tr = Transcript::new();
+        tr.context_used = 156_700;
+        let now = Instant::now();
+        tr.turn_started = Some(now - Duration::from_secs(10));
+        tr.turn_first_token = Some(now - Duration::from_secs(8));
+        tr.turn_stream_chunks = 5;
+        tr.append_assistant("回答正文");
+
+        let usage = TurnUsage {
+            input_tokens: 2_000,
+            output_tokens: 400,
+            cached_read_tokens: 98_000,
+            thought_tokens: 240,
+            total_tokens: 100_640,
+        };
+        tr.finish_turn("Gemini 4 Neon (High)", "end_turn", Some(&usage));
+
+        let done = match &tr.entries.last().unwrap().kind {
+            EntryKind::Assistant { done_line } => done_line.as_deref().unwrap(),
+            other => panic!("expected assistant done line, got {other:?}"),
+        };
+        assert!(done.contains("首字 2.0s"), "missing ttft in done line: {done}");
+        // 生成总计 400 + 240 = 640 tokens，解码耗时约 8s -> 约 80.0 tok/s
+        assert!(done.contains("tok/s"), "missing token speed in done line: {done}");
+        assert!(done.contains("80.0 tok/s"), "unexpected speed in done line: {done}");
+        assert!(done.contains("156.7k(C98%)"), "missing context cache in done line: {done}");
+    }
+
+    #[test]
+    fn generated_tokens_avoids_double_counting_folded_thought_tokens() {
+        let disjoint = TurnUsage {
+            input_tokens: 1000,
+            output_tokens: 300,
+            cached_read_tokens: 0,
+            thought_tokens: 200,
+            total_tokens: 1500,
+        };
+        assert_eq!(generated_tokens(&disjoint), 500);
+
+        let folded = TurnUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_read_tokens: 0,
+            thought_tokens: 200,
+            total_tokens: 1500,
+        };
+        assert_eq!(generated_tokens(&folded), 500);
+
+        assert_eq!(format_latency(Duration::from_millis(420)), "420ms");
+        assert_eq!(format_latency(Duration::from_millis(1850)), "1.9s");
+        assert_eq!(format_token_speed(128.4), "128 tok/s");
+        assert_eq!(format_token_speed(42.56), "42.6 tok/s");
     }
 }

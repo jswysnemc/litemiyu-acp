@@ -1,8 +1,11 @@
 //! 主 TUI 渲染协调器（复刻 LiteMiyu 首页 + 对话双栏视图 + 流光状态行 + 圆角输入框 + 极简底栏）。
 
 pub mod activity;
+mod elicitation;
 pub mod format;
 mod input_box;
+#[cfg(test)]
+mod interaction_tests;
 pub mod overlay;
 pub mod rows;
 pub mod selection;
@@ -21,12 +24,13 @@ use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::acp::{PermissionRequest, SessionSummary};
+use crate::app::{ElicitationState, QueuedMode};
 use crate::background::BackgroundTask;
 use crate::completion::CompletionMenu;
 use crate::input::InputEditor;
 use crate::linebreak;
 use crate::theme;
-use crate::transcript::{Transcript, format_short};
+use crate::transcript::{FoldSection, Transcript, format_short};
 
 /// 对话界面（非开始界面）输入框最大可见行数（内容增加时自动增高，超过后内部滚动）。
 pub const CHAT_INPUT_MAX_ROWS: u16 = 8;
@@ -40,7 +44,7 @@ pub fn input_text_width(box_w: u16) -> u16 {
 
 use overlay::PickerState;
 use rows::{MdCache, RenderRow, RowCopyMeta, build_body, row_to_line};
-use input_box::{draw_input_box, draw_pulse_line, draw_scrollbar};
+use input_box::{InputBoxStatus, draw_input_box, draw_pulse_line, draw_scrollbar};
 use selection::{ScreenSnapshot, apply_selection_highlight};
 pub use selection::TextSelection;
 use sidebar::{SidebarData, SidebarHits};
@@ -54,6 +58,8 @@ pub enum HoverTarget {
     #[default]
     None,
     SidebarBackground(u64),
+    SidebarSubagent(u64),
+    Fold(u64, FoldSection),
     SidebarJump(u64),
     SidebarSession(String),
     SidebarContext,
@@ -92,6 +98,7 @@ pub struct FrameHits {
     pub input_text_width: u16,
     pub sidebar: SidebarHits,
     pub body_rows: Vec<BodyRowHit>,
+    pub fold_rows: HashMap<u16, (u64, FoldSection)>,
     pub total_body_rows: usize,
     pub visible_body_rows: usize,
     pub entry_starts: HashMap<u64, usize>,
@@ -133,14 +140,19 @@ pub struct ViewState<'a> {
     pub started_at: Instant,
     pub toast: Option<(&'a str, bool)>,
     pub background_tasks: &'a [BackgroundTask],
+    pub subagents: &'a [crate::subagent::Agent],
     pub recent_sessions: &'a [SessionSummary],
     pub completion_menu: Option<&'a CompletionMenu>,
     pub completion_selected: usize,
     pub pending_images: usize,
+    pub queued_mode: QueuedMode,
+    pub queued_count: usize,
+    pub queued_head_preview: Option<&'a str>,
     pub selection: Option<TextSelection>,
     pub hover: &'a HoverTarget,
     pub picker: Option<&'a PickerState>,
     pub permission: Option<(&'a PermissionRequest, usize)>,
+    pub elicitation: Option<&'a ElicitationState>,
 }
 
 pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> FrameHits {
@@ -191,6 +203,14 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
             y.saturating_sub(1),
             input_text_width(content_w),
         )
+    } else if let Some(el) = view.elicitation {
+        let drawer_h = elicitation::drawer_height(el, main_area.height);
+        let y = footer_y.saturating_sub(drawer_h);
+        (
+            Rect::new(content_x, y, content_w, drawer_h),
+            y.saturating_sub(1),
+            input_text_width(content_w),
+        )
     } else {
         let text_w = input_text_width(content_w);
         let vlines = view.editor.visual_lines(text_w);
@@ -220,7 +240,7 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
 
     // 1. 构建并渲染正文时间线
     let text_room = body_area.width.saturating_sub(2).max(16);
-    let built = build_body(view.transcript, text_room, view.tick, cache);
+    let built = build_body(view.transcript, view.subagents, text_room, view.tick, cache);
     let total_rows = built.rows.len();
     let visible_rows = usize::from(body_area.height);
     let max_scroll = total_rows.saturating_sub(visible_rows);
@@ -231,6 +251,7 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
     };
 
     let mut body_hits = Vec::new();
+    let mut fold_rows = HashMap::new();
     let mut row_copy_meta = HashMap::new();
     let mut render_lines = Vec::with_capacity(visible_rows);
     for (offset, row) in built
@@ -244,10 +265,17 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         body_hits.push((
             screen_y,
             row.entry_id,
-            row.clickable_entry,
+            row.action == rows::RowAction::Toggle,
             row.links.clone(),
         ));
         row_copy_meta.insert(screen_y, row.copy_meta);
+        if let rows::RowAction::Fold(section) = row.action {
+            fold_rows.insert(screen_y, (row.entry_id, section));
+            if *view.hover == HoverTarget::Fold(row.entry_id, section) {
+                render_lines.push(Line::styled("点击展开10行，右击全部展开", theme::accent_bold().bg(p.row_focus_bg)));
+                continue;
+            }
+        }
         render_lines.push(row_to_line(row));
     }
     frame.render_widget(
@@ -297,9 +325,12 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         );
     }
 
-    // 3. 权限审批抽屉 或 圆角输入框
+    // 3. 权限审批抽屉 / 代理提问抽屉 / 圆角输入框
     let input_text_area = if let Some((req, sel)) = view.permission {
         overlay::draw_permission_drawer(frame, box_area, req, sel);
+        Rect::default()
+    } else if let Some(el) = view.elicitation {
+        elicitation::draw_elicitation_drawer(frame, box_area, el);
         Rect::default()
     } else {
         draw_input_box(
@@ -308,7 +339,13 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
             view.editor,
             view.picker.is_none(),
             false,
-            view.pending_images,
+            InputBoxStatus {
+                pending_images: view.pending_images,
+                queued_mode: view.queued_mode,
+                queued_count: view.queued_count,
+                queued_head_preview: view.queued_head_preview,
+                busy: view.busy,
+            },
         )
     };
 
@@ -332,6 +369,7 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
                 tier: view.tier,
                 current_user_entry,
                 background_tasks: view.background_tasks,
+                subagents: view.subagents,
                 started_at: view.started_at,
                 recent_sessions: view.recent_sessions,
                 hover: view.hover,
@@ -343,6 +381,7 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
 
     // 6. 统一输入补全悬浮菜单（/ 命令 · # Skills · @ 文件） & 模态选择器
     if view.permission.is_none()
+        && view.elicitation.is_none()
         && view.picker.is_none()
         && let Some(menu) = view.completion_menu
     {
@@ -369,6 +408,7 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         && view.selection.is_none()
         && view.picker.is_none()
         && view.permission.is_none()
+        && view.elicitation.is_none()
         && row < full.bottom()
     {
         let buf = frame.buffer_mut();
@@ -400,6 +440,7 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         input_text_width: input_text_w,
         sidebar: sidebar_hits,
         body_rows: body_hits,
+        fold_rows,
         total_body_rows: total_rows,
         visible_body_rows: visible_rows,
         entry_starts: built.entry_starts,
@@ -448,6 +489,10 @@ fn draw_home(frame: &mut Frame, full: Rect, view: &ViewState<'_>) -> FrameHits {
         let dh = (req.options.len() as u16 + 5).clamp(7, 14);
         overlay::draw_permission_drawer(frame, Rect::new(box_x, box_y, box_w, dh), req, sel);
         Rect::default()
+    } else if let Some(el) = view.elicitation {
+        let dh = elicitation::drawer_height(el, full.height);
+        elicitation::draw_elicitation_drawer(frame, Rect::new(box_x, box_y, box_w, dh), el);
+        Rect::default()
     } else {
         draw_input_box(
             frame,
@@ -455,7 +500,13 @@ fn draw_home(frame: &mut Frame, full: Rect, view: &ViewState<'_>) -> FrameHits {
             view.editor,
             view.picker.is_none(),
             true,
-            view.pending_images,
+            InputBoxStatus {
+                pending_images: view.pending_images,
+                queued_mode: view.queued_mode,
+                queued_count: view.queued_count,
+                queued_head_preview: view.queued_head_preview,
+                busy: view.busy,
+            },
         )
     };
 
@@ -495,6 +546,7 @@ fn draw_home(frame: &mut Frame, full: Rect, view: &ViewState<'_>) -> FrameHits {
     }
 
     if view.permission.is_none()
+        && view.elicitation.is_none()
         && view.picker.is_none()
         && let Some(menu) = view.completion_menu
     {
@@ -530,6 +582,17 @@ fn draw_footer(frame: &mut Frame, area: Rect, view: &ViewState<'_>, show_cwd: bo
     if !view.mode_label.is_empty() {
         left_spans.push(Span::styled(" · ", theme::faint()));
         left_spans.push(Span::styled(view.mode_label.to_string(), theme::dim()));
+    }
+    if view.queued_mode == QueuedMode::SendImmediately {
+        left_spans.push(Span::styled(" · ", theme::faint()));
+        left_spans.push(Span::styled(view.queued_mode.short_label(), theme::accent()));
+    }
+    if view.queued_count > 0 {
+        left_spans.push(Span::styled(" · ", theme::faint()));
+        left_spans.push(Span::styled(
+            format!("队列 {}", view.queued_count),
+            theme::accent(),
+        ));
     }
     if !view.background_tasks.is_empty() {
         left_spans.push(Span::styled(" · ", theme::faint()));

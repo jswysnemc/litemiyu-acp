@@ -11,7 +11,8 @@ use crate::linebreak;
 use crate::markdown;
 use crate::theme;
 
-use super::{RenderRow, RowCopyMeta};
+use super::{fold, RenderRow, RowAction, RowCopyMeta};
+use crate::transcript::FoldSection;
 
 pub(super) struct ReadPreviewLine {
     line_no: usize,
@@ -319,7 +320,7 @@ pub(super) fn push_read_preview_rows(
                 entry_id,
                 spans,
                 links: Vec::new(),
-                clickable_entry: true,
+                action: RowAction::Toggle,
                 copy_meta: RowCopyMeta {
                     content_left: u16::try_from(prefix_w).unwrap_or(u16::MAX),
                     decorative: false,
@@ -329,20 +330,7 @@ pub(super) fn push_read_preview_rows(
         }
     }
     if omitted > 0 {
-        out.push(RenderRow {
-            entry_id,
-            spans: vec![
-                Span::raw(" ".repeat(1 + num_w)),
-                Span::styled(format!(" ⋮ 已省略剩余 {omitted} 行"), theme::faint()),
-            ],
-            links: Vec::new(),
-            clickable_entry: true,
-            copy_meta: RowCopyMeta {
-                content_left: u16::try_from(prefix_w).unwrap_or(u16::MAX),
-                decorative: true,
-                join_previous: false,
-            },
-        });
+        out.push(fold::marker(entry_id, FoldSection::ToolReadPreview, omitted));
     }
     for notice in &preview.notices {
         out.push(RenderRow {
@@ -352,7 +340,7 @@ pub(super) fn push_read_preview_rows(
                 Span::styled(linebreak::clip(notice, width.saturating_sub(2)), theme::faint()),
             ],
             links: Vec::new(),
-            clickable_entry: true,
+            action: RowAction::Toggle,
             copy_meta: RowCopyMeta {
                 content_left: 1,
                 decorative: true,
@@ -462,7 +450,7 @@ pub(super) fn push_highlighted_command_lines(
             entry_id,
             spans,
             links: Vec::new(),
-            clickable_entry: true,
+            action: RowAction::Toggle,
             copy_meta: RowCopyMeta {
                 content_left: 4,
                 decorative: false,
@@ -471,20 +459,7 @@ pub(super) fn push_highlighted_command_lines(
         });
     }
     if omitted > 0 {
-        out.push(RenderRow {
-            entry_id,
-            spans: vec![
-                Span::styled("⋮ ", theme::faint()),
-                Span::styled(format!("已省略 {omitted} 行命令"), theme::faint()),
-            ],
-            links: Vec::new(),
-            clickable_entry: true,
-            copy_meta: RowCopyMeta {
-                content_left: 2,
-                decorative: true,
-                join_previous: false,
-            },
-        });
+        out.push(fold::marker(entry_id, FoldSection::ToolCommand, omitted));
     }
 }
 
@@ -493,7 +468,7 @@ pub(super) fn push_detail_lines(
     text: &str,
     style: Style,
     inner_w: usize,
-    max_lines: usize,
+    (section, max_lines): (FoldSection, usize),
     out: &mut Vec<RenderRow>,
 ) {
     let mut wrapped = Vec::new();
@@ -513,7 +488,7 @@ pub(super) fn push_detail_lines(
                 Span::styled(line, style),
             ],
             links: Vec::new(),
-            clickable_entry: true,
+            action: RowAction::Toggle,
             copy_meta: RowCopyMeta {
                 content_left: 2,
                 decorative: false,
@@ -522,19 +497,6 @@ pub(super) fn push_detail_lines(
         });
     }
     if omitted > 0 {
-        out.push(RenderRow {
-            entry_id,
-            spans: vec![
-                Span::styled("⋮ ", theme::faint()),
-                Span::styled(format!("已省略 {omitted} 行"), theme::faint()),
-            ],
-            links: Vec::new(),
-            clickable_entry: true,
-            copy_meta: RowCopyMeta {
-                content_left: 2,
-                decorative: true,
-                join_previous: false,
-            },
-        });
+        out.push(fold::marker(entry_id, section, omitted));
     }
 }

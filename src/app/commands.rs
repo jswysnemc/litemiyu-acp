@@ -1,18 +1,24 @@
 //! 用户消息提交、本地斜杠命令、会话新建/恢复与模型模式配置指令。
 
-use std::time::Instant;
-
-use crate::acp::{AcpCommand, ImagePayload};
+use crate::acp::AcpCommand;
 use crate::clipboard;
 use crate::theme::{self, ThemePreset};
-use crate::transcript::ImageChip;
 
 use crate::ui::overlay::PickerKind;
 
-use super::{App, PendingImage};
+use super::{App, PendingImage, QueuedMessage, QueuedMode};
 
 impl App {
-    pub(super) fn submit_text(&mut self, text: String) {
+    pub(crate) fn submit_text(&mut self, text: String) {
+        self.submit_message(text, false);
+    }
+
+    /// 提交用户输入：本地命令即时生效；普通消息按空闲/生成态与 `queued_mode` 决定直发、排队或并发插话。
+    ///
+    /// 参数:
+    /// - `text`: 输入框展开后的文本
+    /// - `force_immediate`: 为 `true` 时无视 `Queue` 模式直接并发发送（如 `Ctrl+S`）
+    pub(super) fn submit_message(&mut self, text: String, force_immediate: bool) {
         let trimmed = text.trim();
         let pending = std::mem::take(&mut self.pending_images);
         let attached: Vec<PendingImage> = pending
@@ -24,75 +30,36 @@ impl App {
             return;
         }
         if attached.is_empty()
-            && let Some(rest) = trimmed.strip_prefix('/') {
-                let mut parts = rest.splitn(2, char::is_whitespace);
-                let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
-                let arg = parts.next().unwrap_or("").trim();
-                if self.try_local_command(&cmd, arg) {
-                    return;
-                }
+            && let Some(rest) = trimmed.strip_prefix('/')
+        {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
+            let arg = parts.next().unwrap_or("").trim();
+            if self.try_local_command(&cmd, arg) {
+                return;
             }
-
-        if self.busy {
-            self.pending_images = attached;
-            self.toast("当前正在生成中，请稍候或按 Esc 中断", true);
-            return;
         }
-        let Some(sid) = self.transcript.session_id.clone() else {
+
+        if self.connecting || self.transcript.session_id.is_none() {
             self.pending_images = attached;
             self.toast("ACP 会话尚未就绪，请稍候", true);
             return;
-        };
-
-        let display_text = if trimmed.is_empty() {
-            attached
-                .iter()
-                .map(|a| a.label.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        } else {
-            text.clone()
-        };
-        let chips: Vec<ImageChip> = attached
-            .iter()
-            .map(|a| ImageChip {
-                label: a.label.clone(),
-                path: a.image.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-            })
-            .collect();
-        let payloads: Vec<ImagePayload> = attached
-            .into_iter()
-            .map(|a| ImagePayload {
-                mime_type: a.image.mime_type,
-                base64_data: a.image.base64_data,
-            })
-            .collect();
-
-        // 发送给 ACP 后端前将 `#skill` 引用透明转译为后端原生可识别形式，同时正文保留用户输入原文
-        let prompt_text = if text.contains('#') {
-            let skills = self.completion_cache.skills_for(&self.cwd);
-            crate::completion::rewrite_skill_mentions(&text, skills, &self.available_commands)
-        } else {
-            text
-        };
-
-        // 若上一轮服务端异步续答尚未静默收尾，先补齐 ▣ 结束行再开启新回合
-        self.finish_async_turn();
-        self.transcript.push_user(display_text, chips);
-        self.transcript.turn_started = Some(Instant::now());
-        self.busy = true;
-        self.auto_follow = true;
-        if let Some(client) = &self.client {
-            client.send(AcpCommand::Prompt {
-                session_id: sid,
-                text: prompt_text,
-                images: payloads,
-            });
-        } else {
-            self.busy = false;
-            self.transcript
-                .push_notice("当前为 --demo 离线预览模式，去掉 --demo 即可连接 agy acp", false);
         }
+
+        let msg = QueuedMessage {
+            text,
+            images: attached,
+            already_displayed: false,
+        };
+        if self.is_generating() {
+            if force_immediate || self.queued_mode == QueuedMode::SendImmediately {
+                self.dispatch_prompt(msg);
+            } else {
+                self.enqueue_message(msg);
+            }
+            return;
+        }
+        self.dispatch_prompt(msg);
     }
 
     fn try_local_command(&mut self, cmd: &str, arg: &str) -> bool {
@@ -111,6 +78,37 @@ impl App {
             }
             "mode" => {
                 self.open_mode_picker();
+                true
+            }
+            "queue" => {
+                let sub = arg.trim();
+                if sub.is_empty() {
+                    self.open_queue_picker();
+                } else if sub.eq_ignore_ascii_case("toggle") {
+                    let next = match self.queued_mode {
+                        QueuedMode::Queue => QueuedMode::SendImmediately,
+                        QueuedMode::SendImmediately => QueuedMode::Queue,
+                    };
+                    self.set_queued_mode(next);
+                } else if sub.eq_ignore_ascii_case("send") {
+                    if !self.send_queued_head_immediately() {
+                        self.toast("当前待发队列为空", false);
+                    }
+                } else if sub.eq_ignore_ascii_case("pop") {
+                    if !self.recall_last_queued_to_editor() {
+                        self.toast("当前待发队列为空", false);
+                    }
+                } else if sub.eq_ignore_ascii_case("clear") {
+                    let cleared = self.clear_queued_messages();
+                    self.toast(format!("已清空 {cleared} 条待发队列消息"), false);
+                } else if let Some(mode) = QueuedMode::parse(sub) {
+                    self.set_queued_mode(mode);
+                } else {
+                    self.toast(
+                        "用法: /queue [queue|steer|toggle|send|pop|clear]",
+                        true,
+                    );
+                }
                 true
             }
             "resume" => {
@@ -265,13 +263,19 @@ impl App {
     }
 
     pub(super) fn start_new_session(&mut self) {
+        self.pending_resume = None;
         self.transcript.clear();
+        self.subagents.clear();
         self.background.clear();
         self.completion_cache.invalidate();
         self.completion_dismissed_text = None;
         self.pending_images.clear();
         self.image_seq = 0;
+        self.queued_messages.clear();
+        self.in_flight_prompts.clear();
         self.busy = false;
+        self.permission = None;
+        self.elicitation = None;
         self.async_turn_last_event = None;
         self.async_turn_saw_usage = false;
         self.connecting = true;
@@ -295,14 +299,20 @@ impl App {
             .find(|s| s.session_id == session_id && !s.cwd.is_empty())
             .map(|s| s.cwd.clone())
             .unwrap_or_else(|| self.cwd.clone());
+        self.pending_resume = Some(session_id.clone());
         self.transcript.clear();
+        self.subagents.clear();
         self.background.clear();
         self.completion_cache.invalidate();
         self.completion_dismissed_text = None;
+        self.permission = None;
+        self.elicitation = None;
         self.async_turn_last_event = None;
         self.async_turn_saw_usage = false;
         self.pending_images.clear();
         self.image_seq = 0;
+        self.queued_messages.clear();
+        self.in_flight_prompts.clear();
         self.cwd = target_cwd.clone();
         self.connecting = true;
         self.auto_follow = true;
@@ -316,6 +326,15 @@ impl App {
     }
 
     pub(super) fn cancel_turn(&mut self) {
+        if let Some(state) = self.elicitation.take()
+            && let Some(client) = &self.client
+        {
+            client.send(AcpCommand::AnswerElicitation {
+                rpc_id: state.req.rpc_id,
+                action: "cancel".to_string(),
+                content: None,
+            });
+        }
         if let (Some(client), Some(sid)) = (&self.client, self.transcript.session_id.clone()) {
             client.send(AcpCommand::Cancel { session_id: sid });
             self.toast("已发送中断请求…", false);

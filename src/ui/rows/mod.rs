@@ -12,8 +12,10 @@ use crate::diff;
 use crate::linebreak;
 use crate::markdown::{self, MdLine};
 use crate::theme::{self, ThemePreset};
-use crate::transcript::{Entry, EntryKind, Transcript, format_duration, format_short};
+use crate::transcript::{Entry, EntryKind, FoldSection, Transcript, format_duration, format_short};
 
+mod fold;
+mod subagent;
 mod tool;
 mod tool_meta;
 
@@ -36,8 +38,15 @@ pub struct RenderRow {
     pub entry_id: u64,
     pub spans: Vec<Span<'static>>,
     pub links: Vec<(u16, u16, String)>,
-    pub clickable_entry: bool,
+    pub action: RowAction,
     pub copy_meta: RowCopyMeta,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAction {
+    None,
+    Toggle,
+    Fold(FoldSection),
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -175,7 +184,8 @@ fn preset_id(p: ThemePreset) -> u8 {
         ThemePreset::MiyuNight => 1,
         ThemePreset::MiyuForest => 2,
         ThemePreset::MiyuDay => 3,
-        ThemePreset::Terminal => 4,
+        ThemePreset::MiyuPaper => 4,
+        ThemePreset::Terminal => 5,
     }
 }
 
@@ -186,6 +196,7 @@ pub struct BuiltBody {
 
 pub fn build_body(
     transcript: &Transcript,
+    subagents: &[crate::subagent::Agent],
     width: u16,
     tick: usize,
     cache: &mut MdCache,
@@ -213,6 +224,7 @@ pub fn build_body(
                 expanded,
             } => build_thought(
                 entry,
+                transcript.fold_reveal(entry.id, FoldSection::Thought).effective_limit(3),
                 *started,
                 *elapsed,
                 *expanded,
@@ -221,6 +233,10 @@ pub fn build_body(
                 cache,
                 &mut rows,
             ),
+            EntryKind::Tool { expanded, name, .. } if crate::subagent::is_subagent_family_tool(name)
+                && subagents.iter().any(|agent| agent.entry_id == entry.id) => {
+                subagent::append(entry.id, subagents, *expanded, width, &mut rows);
+            }
             EntryKind::Tool {
                 name,
                 title,
@@ -233,6 +249,7 @@ pub fn build_body(
                 ..
             } => build_tool(
                 entry.id,
+                transcript,
                 name,
                 title,
                 kind,
@@ -271,7 +288,7 @@ fn build_user(
         entry_id: entry.id,
         spans: vec![bar.clone()],
         links: Vec::new(),
-        clickable_entry: false,
+        action: RowAction::None,
         copy_meta: RowCopyMeta {
             content_left: 2,
             decorative: true,
@@ -295,7 +312,7 @@ fn build_user(
                 entry_id: entry.id,
                 spans,
                 links: line_links,
-                clickable_entry: false,
+                action: RowAction::None,
                 copy_meta: RowCopyMeta {
                     content_left: 2,
                     decorative: false,
@@ -308,7 +325,7 @@ fn build_user(
         entry_id: entry.id,
         spans: vec![bar],
         links: Vec::new(),
-        clickable_entry: false,
+        action: RowAction::None,
         copy_meta: RowCopyMeta {
             content_left: 2,
             decorative: true,
@@ -366,6 +383,7 @@ fn style_image_chips(
 #[allow(clippy::too_many_arguments)]
 fn build_thought(
     entry: &Entry,
+    preview_limit: usize,
     started: std::time::Instant,
     elapsed: Option<std::time::Duration>,
     expanded: bool,
@@ -387,7 +405,7 @@ fn build_thought(
     if est_tokens > 0 {
         header.push_str(&format!(" · {}", format_short(est_tokens)));
     }
-    let hint = if expanded { " ▾" } else { " ▸" };
+    let hint = if expanded || preview_limit > 3 { " ▾" } else { " ▸" };
     let header_style = if busy { theme::accent() } else { theme::dim() };
 
     out.push(RenderRow {
@@ -397,7 +415,7 @@ fn build_thought(
             Span::styled(hint, theme::faint()),
         ],
         links: Vec::new(),
-        clickable_entry: true,
+        action: RowAction::Toggle,
         copy_meta: RowCopyMeta::default(),
     });
 
@@ -409,7 +427,6 @@ fn build_thought(
     let inner_w = usize::from(width.saturating_sub(2)).max(1);
     let wrapped = cache.wrap_thought(entry.id, trimmed, inner_w);
 
-    let preview_limit = 3;
     let shown: &[String] = if expanded || wrapped.len() <= preview_limit {
         wrapped
     } else {
@@ -417,23 +434,7 @@ fn build_thought(
     };
 
     if !expanded && wrapped.len() > preview_limit {
-        out.push(RenderRow {
-            entry_id: entry.id,
-            spans: vec![
-                Span::styled("⋮ ", theme::faint()),
-                Span::styled(
-                    format!("已折叠前 {} 行（点击或 Ctrl+O 展开）", wrapped.len() - preview_limit),
-                    theme::faint(),
-                ),
-            ],
-            links: Vec::new(),
-            clickable_entry: true,
-            copy_meta: RowCopyMeta {
-                content_left: 2,
-                decorative: true,
-                join_previous: false,
-            },
-        });
+        out.push(fold::marker(entry.id, FoldSection::Thought, wrapped.len() - preview_limit));
     }
 
     for line in shown {
@@ -444,7 +445,7 @@ fn build_thought(
                 Span::styled(line.clone(), theme::thought()),
             ],
             links: Vec::new(),
-            clickable_entry: true,
+            action: RowAction::Toggle,
             copy_meta: RowCopyMeta {
                 content_left: 2,
                 decorative: false,
@@ -478,7 +479,7 @@ fn build_assistant(
             entry_id: entry.id,
             spans: line.to_spans(),
             links,
-            clickable_entry: false,
+            action: RowAction::None,
             copy_meta: RowCopyMeta {
                 content_left: line.content_offset,
                 decorative: line.decorative,
@@ -498,7 +499,7 @@ fn build_assistant(
                 theme::faint(),
             )],
             links: Vec::new(),
-            clickable_entry: false,
+            action: RowAction::None,
             copy_meta: RowCopyMeta::default(),
         });
     }
@@ -517,7 +518,7 @@ fn build_plan(
         entry_id,
         spans: vec![Span::styled("◈ 任务计划", theme::side_title())],
         links: Vec::new(),
-        clickable_entry: false,
+        action: RowAction::None,
         copy_meta: RowCopyMeta::default(),
     });
     for item in items {
@@ -537,7 +538,7 @@ fn build_plan(
                 ),
             ],
             links: Vec::new(),
-            clickable_entry: false,
+            action: RowAction::None,
             copy_meta: RowCopyMeta::default(),
         });
     }
@@ -558,7 +559,7 @@ fn build_notice(entry: &Entry, is_error: bool, width: u16, out: &mut Vec<RenderR
                     Span::styled(cells[r].concat(), style),
                 ],
                 links: Vec::new(),
-                clickable_entry: false,
+                action: RowAction::None,
                 copy_meta: RowCopyMeta::default(),
             });
         }
@@ -570,7 +571,7 @@ fn blank_row(entry_id: u64) -> RenderRow {
         entry_id,
         spans: Vec::new(),
         links: Vec::new(),
-        clickable_entry: false,
+        action: RowAction::None,
         copy_meta: RowCopyMeta::default(),
     }
 }

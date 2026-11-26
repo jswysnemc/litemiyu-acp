@@ -16,7 +16,7 @@ impl App {
     /// 返回:
     /// - 界面状态实际发生变化（需要重绘）时返回 `true`，空白区移动等无效事件返回 `false`
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
-        if self.picker.is_some() || self.permission.is_some() {
+        if self.picker.is_some() || self.permission.is_some() || self.elicitation.is_some() {
             let cleared = self.hover != HoverTarget::None;
             self.hover = HoverTarget::None;
             if self.picker.is_some() {
@@ -95,6 +95,9 @@ impl App {
                 self.dragging_scrollbar = false;
                 true
             }
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.reveal_fold_at(mouse.column, mouse.row, true)
+            }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let col = mouse.column;
                 let row = mouse.row;
@@ -164,6 +167,9 @@ impl App {
         // 2. 右侧边栏紧凑交互项（后台任务、上下文进度区、跳转消息、最近会话）
         let side = &self.last_hits.sidebar;
         if side.area.width > 0 && col >= side.area.x && col < side.area.right() {
+            if let Some((_, entry)) = side.subagent_rows.iter().find(|(screen_y, _)| *screen_y == row) {
+                return HoverTarget::SidebarSubagent(*entry);
+            }
             if let Some((_, eid)) = side.bg_rows.iter().find(|(y, _)| *y == row) {
                 return HoverTarget::SidebarBackground(*eid);
             }
@@ -178,7 +184,12 @@ impl App {
             }
             return HoverTarget::None;
         }
-        // 3. 正文内紧凑行内链接（不给正文折叠头或整行加 hover）
+        // 3. 【正文】【折叠提示】仅命中实际提示行，避免覆盖工具标题与滚动条
+        if rect_contains(self.last_hits.body_text, col, row)
+            && let Some(&(entry, section)) = self.last_hits.fold_rows.get(&row)
+        {
+            return HoverTarget::Fold(entry, section);
+        }
         if col >= self.last_hits.body.x && col < self.last_hits.body.right() {
             let rel_col = col.saturating_sub(self.last_hits.body.x);
             if let Some((_, _, _, links)) = self
@@ -240,6 +251,17 @@ impl App {
     }
 
     fn handle_left_click(&mut self, col: u16, row: u16) {
+        if let HoverTarget::SidebarSubagent(entry) = self.resolve_hover_target(col, row) {
+            self.transcript.set_entry_expanded(entry, true);
+            if let Some(start) = self.last_hits.entry_starts.get(&entry) {
+                self.scroll = *start;
+                self.auto_follow = false;
+            }
+            return;
+        }
+        if self.reveal_fold_at(col, row, false) {
+            return;
+        }
         // 0. 点击「回到底部」/ 底栏用量格 / 侧边栏上下文进度条
         if rect_contains(self.last_hits.bottom_button, col, row) {
             self.jump_to_bottom();
@@ -321,6 +343,23 @@ impl App {
         }
     }
 
+
+    /// 【正文】【展开折叠行】按屏幕坐标展开分区，`all` 决定是否全部展开，返回是否命中。
+    fn reveal_fold_at(&mut self, col: u16, row: u16, all: bool) -> bool {
+        if !rect_contains(self.last_hits.body_text, col, row) {
+            return false;
+        }
+        let Some(&(entry, section)) = self.last_hits.fold_rows.get(&row) else { return false };
+        // 1. 固定当前视口起点，新增内容不会把点击位置推离屏幕
+        if self.auto_follow {
+            self.scroll = self.last_hits.total_body_rows.saturating_sub(self.last_hits.visible_body_rows);
+        }
+        self.auto_follow = false;
+        self.selection = None;
+        self.hover = HoverTarget::None;
+        self.transcript.reveal_fold(entry, section, all);
+        true
+    }
 
     fn jump_to_bottom(&mut self) {
         let max_scroll = self

@@ -16,6 +16,7 @@ mod linebreak;
 mod markdown;
 mod paste;
 mod paths;
+mod subagent;
 mod theme;
 mod transcript;
 mod ui;
@@ -65,7 +66,7 @@ struct Cli {
     #[arg(short, long)]
     resume: Option<String>,
 
-    /// 指定主题（miyu-lavender / miyu-night / miyu-forest / miyu-day / terminal）
+    /// 指定主题（miyu-lavender / miyu-night / miyu-forest / miyu-day / miyu-paper / terminal）
     #[arg(long)]
     theme: Option<String>,
 
@@ -107,10 +108,13 @@ async fn main() -> Result<()> {
         .into_owned();
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AcpEvent>();
+    let (program, args) = parse_command(&cli.cmd);
+    let local_agy = !cli.demo && args.first().is_some_and(|arg| arg == "acp")
+        && std::path::Path::new(&program).file_name().and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("agy") || name.eq_ignore_ascii_case("agy.exe"));
     let client = if cli.demo {
         None
     } else {
-        let (program, args) = parse_command(&cli.cmd);
         Some(AcpClient::spawn(program, args, cwd.clone(), event_tx)?)
     };
 
@@ -120,6 +124,8 @@ async fn main() -> Result<()> {
         prefs.show_sidebar
     };
     let mut app = App::new(client, cwd, cli.resume, show_sidebar, cli.demo);
+    app.queued_mode = prefs.queued_mode;
+    if local_agy && let Some(root) = paths::agy_brain_dir() { app.subagents.enable_local(root); }
 
     // 终端初始化与 panic 还原保护
     let orig_hook = std::panic::take_hook();

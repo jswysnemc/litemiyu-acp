@@ -2,6 +2,7 @@
 //! 通过标准 ACP `tool_call` / `tool_call_update` 生命周期与回合边界识别仍在后台运行的异步任务，
 //! 在不依赖特定后端私有日志路径的前提下，向前台提供准确的运行标记、摘要与跳转目标。
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -48,12 +49,15 @@ pub struct FinishedBackgroundTask {
 #[derive(Debug, Default)]
 pub struct BackgroundTracker {
     active: Vec<BackgroundTask>,
+    /// 交互式提问类工具 call_id 集合，确保增量 update 缺省 name 时也不会误入后台追踪
+    ignored_calls: HashSet<String>,
 }
 
 impl BackgroundTracker {
     /// 清空全部追踪状态（用于新建会话、切换/加载会话或连接断开）。
     pub fn clear(&mut self) {
         self.active.clear();
+        self.ignored_calls.clear();
     }
 
     /// 记录或更新一条实时 `tool_call` / `tool_call_update` 事件。
@@ -84,7 +88,27 @@ impl BackgroundTracker {
             return None;
         }
 
-        // 1. 若收到终态状态，立即移出活跃列表，并在其为后台任务时返回完成通知
+        // 1. 交互式提问工具与子代理/多代理工具由各自专属模块处理，不纳入通用后台命令追踪
+        let raw_name = name.unwrap_or("");
+        if is_interactive_question_tool(raw_name)
+            || crate::subagent::is_subagent_family_tool(raw_name)
+        {
+            self.ignored_calls.insert(call_id.to_string());
+            if let Some(pos) = self.active.iter().position(|t| t.call_id == call_id) {
+                self.active.remove(pos);
+            }
+            return None;
+        }
+        if self.ignored_calls.contains(call_id) {
+            if let Some(st) = status
+                && is_terminal_status(st)
+            {
+                self.ignored_calls.remove(call_id);
+            }
+            return None;
+        }
+
+        // 2. 若收到终态状态，立即移出活跃列表，并在其为后台任务时返回完成通知
         if let Some(st) = status
             && is_terminal_status(st)
         {
@@ -224,6 +248,15 @@ fn is_failure_status(status: &str) -> bool {
     )
 }
 
+/// 判断工具是否属于等待用户交互回复的提问工具（不应被归类为后台任务）。
+fn is_interactive_question_tool(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "ask_question" | "askquestion" | "elicitation"
+    )
+}
+
 /// 判断工具在启动参数或名称上是否显式声明为后台/异步任务。
 fn is_explicit_background(name: Option<&str>, raw_input: Option<&Value>) -> bool {
     if let Some(inp) = raw_input {
@@ -235,12 +268,7 @@ fn is_explicit_background(name: Option<&str>, raw_input: Option<&Value>) -> bool
     }
     if let Some(n) = name {
         let lower = n.to_ascii_lowercase();
-        if matches!(
-            lower.as_str(),
-            "invoke_subagent" | "run_workflow" | "schedule" | "swarm"
-        ) || lower.contains("background")
-            || lower.contains("subagent")
-        {
+        if matches!(lower.as_str(), "schedule") || lower.contains("background") {
             return true;
         }
     }
@@ -258,8 +286,6 @@ fn is_backgroundable_tool(kind: &str, name: &str) -> bool {
         || lower.contains("bash")
         || lower.contains("exec")
         || lower.contains("terminal")
-        || lower.contains("workflow")
-        || lower.contains("subagent")
         || lower.contains("schedule")
         || lower.contains("task")
 }
@@ -431,5 +457,33 @@ mod tests {
         tracker.on_prompt_finished("cancelled");
         assert_eq!(tracker.running_count(), 1);
         assert_eq!(tracker.running_tasks()[0].call_id, "c_daemon");
+    }
+
+    #[test]
+    fn subagent_family_tools_are_excluded_from_background_tracker() {
+        let mut tracker = BackgroundTracker::default();
+        let started = tracker.on_tool_event(
+            "c_sub",
+            40,
+            Some("invoke_subagent"),
+            Some("Codebase Researcher"),
+            Some("other"),
+            Some("in_progress"),
+            Some(&json!({ "Role": "Codebase Researcher" })),
+        );
+        assert!(started.is_none());
+        assert!(!tracker.has_running());
+
+        let finished = tracker.on_tool_event(
+            "c_sub",
+            40,
+            None,
+            None,
+            None,
+            Some("completed"),
+            None,
+        );
+        assert!(finished.is_none());
+        assert_eq!(tracker.running_count(), 0);
     }
 }
