@@ -1,6 +1,6 @@
 [package]
 name = "litemiyu-acp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Lightweight high-aesthetics ACP TUI client inspired by LiteMiyu, designed for agy acp and any ACP v1 server"
 license = "AGPL-3.0-or-later"
