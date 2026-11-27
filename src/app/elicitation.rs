@@ -480,7 +480,67 @@ impl App {
         }
     }
 
-    fn try_submit_elicitation(&mut self) {
+    /// 响应鼠标单击提问抽屉中的单个选项或自定义输入行。
+    ///
+    /// 参数:
+    /// - `opt_idx`: 被点击选项的索引（或自定义输入行对应的尾部索引）
+    /// - `is_other`: 是否点击了自定义自由输入行
+    pub(super) fn click_elicitation_option(&mut self, opt_idx: usize, is_other: bool) {
+        let Some(state) = self.elicitation.as_mut() else {
+            return;
+        };
+        let field_count = state.req.fields.len();
+        if field_count == 0 {
+            return;
+        }
+        let active = state.active_field.min(field_count - 1);
+        state.active_field = active;
+        let has_other = state.req.fields[active].other_key.is_some();
+        state.answers[active].cursor_opt = opt_idx;
+
+        // 1. 点击自定义输入行：进入自由输入模式
+        if is_other && has_other {
+            state.answers[active].editing_text = true;
+            return;
+        }
+        state.answers[active].editing_text = false;
+
+        // 2. 单选/布尔点击即选中并推进或提交，多选点击切换勾选状态
+        match &state.req.fields[active].kind {
+            ElicitationFieldKind::SingleSelect(opts) => {
+                if opt_idx >= opts.len() {
+                    return;
+                }
+                state.answers[active].selected_idx = Some(opt_idx);
+                if has_other
+                    && opts[opt_idx].value.eq_ignore_ascii_case("other")
+                    && state.answers[active].text.trim().is_empty()
+                {
+                    state.answers[active].editing_text = true;
+                } else if active + 1 < field_count {
+                    state.active_field = active + 1;
+                } else {
+                    self.try_submit_elicitation();
+                }
+            }
+            ElicitationFieldKind::MultiSelect { .. } => {
+                if let Some(cell) = state.answers[active].checked.get_mut(opt_idx) {
+                    *cell = !*cell;
+                }
+            }
+            ElicitationFieldKind::Boolean { .. } => {
+                state.answers[active].bool_val = opt_idx == 0;
+                if active + 1 < field_count {
+                    state.active_field = active + 1;
+                } else {
+                    self.try_submit_elicitation();
+                }
+            }
+            ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Number { .. } => {}
+        }
+    }
+
+    pub(super) fn try_submit_elicitation(&mut self) {
         let Some(state) = &self.elicitation else {
             return;
         };
@@ -494,7 +554,7 @@ impl App {
         }
     }
 
-    fn answer_elicitation(&mut self, action: &str, content: Option<Value>) {
+    pub(super) fn answer_elicitation(&mut self, action: &str, content: Option<Value>) {
         if let Some(state) = self.elicitation.take()
             && let Some(client) = &self.client
         {

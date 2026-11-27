@@ -24,7 +24,7 @@ fn buffer_to_text(buf: &ratatui::buffer::Buffer, w: u16, h: u16) -> String {
 #[test]
 fn demo_screen_renders_cleanly_at_wide_and_narrow_sizes() {
     theme::init(ThemePreset::MiyuLavender, true);
-    let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+    let mut app = App::new(None, r"D:\Code\agy-tui".into(), None, true, true);
     app.auto_follow = false;
     app.scroll = 0;
 
@@ -58,7 +58,7 @@ fn demo_screen_renders_cleanly_at_wide_and_narrow_sizes() {
         assert!(bottom_view.contains("▣"), "missing done meta row at {w}x{h}");
         let footer_row = bottom_view.lines().last().unwrap_or("");
         assert!(
-            footer_row.contains("litemiyu-acp"),
+            footer_row.contains("agy-tui"),
             "bottom-right footer should show current working directory at {w}x{h}: {footer_row:?}"
         );
 
@@ -237,7 +237,7 @@ fn demo_screen_renders_cleanly_at_wide_and_narrow_sizes() {
 #[test]
 fn chat_input_box_grows_dynamically_and_caps_at_max_rows() {
     theme::init(ThemePreset::MiyuLavender, true);
-    let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+    let mut app = App::new(None, r"D:\Code\agy-tui".into(), None, true, true);
     let backend = TestBackend::new(120, 40);
     let mut terminal = Terminal::new(backend).unwrap();
 
@@ -269,7 +269,7 @@ fn chat_input_box_grows_dynamically_and_caps_at_max_rows() {
 #[test]
 fn resume_picker_shows_current_dir_scope_timestamps_and_switches_to_all() {
     theme::init(ThemePreset::MiyuLavender, true);
-    let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+    let mut app = App::new(None, r"D:\Code\agy-tui".into(), None, true, true);
     app.editor.set_text("/resume");
     app.handle_key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Enter,
@@ -299,7 +299,7 @@ fn resume_picker_shows_current_dir_scope_timestamps_and_switches_to_all() {
 #[test]
 fn busy_bottom_status_renders_sai_companion_and_status_label() {
     theme::init(ThemePreset::MiyuLavender, true);
-    let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+    let mut app = App::new(None, r"D:\Code\agy-tui".into(), None, true, true);
     app.busy = true;
     app.transcript.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
     app.transcript.append_thought("checking animation state");
@@ -324,12 +324,17 @@ fn busy_bottom_status_renders_sai_companion_and_status_label() {
         view.contains("Esc 中断"),
         "busy bottom pulse line should keep right-aligned Esc hint:\n{view}"
     );
-    // 验证状态行紧贴输入框上方，且与正文底部留有 1 行空白分隔
+    // 验证状态行紧贴输入框上方，且正文底部与底部固定任务栏/状态行之间留有 1 行空白分隔
     let pulse_y = app.last_hits.input_area.y.saturating_sub(1);
+    let chrome_top = if app.last_hits.todo_bar_toggle.height > 0 {
+        app.last_hits.todo_bar_toggle.y
+    } else {
+        pulse_y
+    };
     assert_eq!(
         app.last_hits.body.bottom() + 1,
-        pulse_y,
-        "body bottom should keep 1 blank row above pulse line"
+        chrome_top,
+        "body bottom should keep 1 blank row above bottom todo bar / pulse line"
     );
     let lines: Vec<&str> = view.lines().collect();
     let pulse_row = lines[usize::from(pulse_y)];
@@ -342,7 +347,7 @@ fn busy_bottom_status_renders_sai_companion_and_status_label() {
 #[test]
 fn hover_highlights_sidebar_items_without_affecting_body_fold_rows() {
     theme::init(ThemePreset::MiyuLavender, true);
-    let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+    let mut app = App::new(None, r"D:\Code\agy-tui".into(), None, true, true);
     let backend = TestBackend::new(140, 40);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| app.render(f)).unwrap();
@@ -393,7 +398,7 @@ fn hover_highlights_sidebar_items_without_affecting_body_fold_rows() {
 #[test]
 fn dragging_from_margins_never_copies_right_scrollbar_or_sidebar_divider() {
     theme::init(ThemePreset::MiyuLavender, true);
-    let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+    let mut app = App::new(None, r"D:\Code\agy-tui".into(), None, true, true);
     app.auto_follow = true;
     let backend = TestBackend::new(140, 40);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -655,7 +660,7 @@ fn esc_cancels_active_async_followup_and_emits_cancelled_line() {
 #[test]
 fn completion_menu_supports_slash_commands_hash_skills_and_at_files() {
     let root = std::env::temp_dir().join(format!(
-        "litemiyu_ui_completion_{}",
+        "agy_tui_ui_completion_{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&root);

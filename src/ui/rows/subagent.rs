@@ -2,7 +2,7 @@
 
 use ratatui::text::Span;
 
-use super::{RenderRow, RowAction, RowCopyMeta};
+use super::{fold, RenderRow, RowAction, RowCopyMeta};
 use crate::subagent::{Agent, Phase};
 use crate::{linebreak, theme};
 
@@ -14,7 +14,9 @@ pub(super) fn append(
     width: u16,
     rows: &mut Vec<RenderRow>,
 ) {
+    let mut rendered_any = false;
     for agent in agents.iter().filter(|agent| agent.entry_id == entry_id) {
+        rendered_any = true;
         let mark = if expanded { "▾" } else { "▸" };
         let title = format!("{mark} 子代理 · {}", agent.headline());
         let style = match agent.phase {
@@ -26,6 +28,7 @@ pub(super) fn append(
             entry_id,
             spans: vec![Span::styled(linebreak::clip(&title, width), style)],
             links: Vec::new(),
+            buttons: Vec::new(),
             action: RowAction::Toggle,
             copy_meta: RowCopyMeta::default(),
         });
@@ -38,10 +41,14 @@ pub(super) fn append(
                         theme::dim(),
                     )],
                     links: Vec::new(),
+                    buttons: Vec::new(),
                     action: RowAction::Toggle,
                     copy_meta: RowCopyMeta::default(),
                 });
             }
         }
+    }
+    if expanded && rendered_any {
+        rows.push(fold::collapse_bar(entry_id));
     }
 }

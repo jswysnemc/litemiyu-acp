@@ -10,12 +10,19 @@ use crate::linebreak;
 use crate::theme;
 use crate::transcript::{FoldSection, Transcript};
 
-use super::tool_meta::{
-    build_read_preview, clip_highlighted_shell, extract_command_text, extract_read_path,
-    file_basename, is_read_tool_call, push_detail_lines, push_highlighted_command_lines,
+use super::fold::{self, ActionBarOptions};
+use super::read_preview::{
+    build_read_preview, extract_read_path, file_basename, is_read_tool_call,
     push_read_preview_rows, read_header_range_badge,
 };
-use super::{fold, MdCache, RenderRow, RowAction, RowCopyMeta, SPINNER};
+use super::tool_meta::{
+    clip_highlighted_shell, extract_command_text, push_detail_lines,
+    push_highlighted_command_lines,
+};
+use super::{MdCache, RenderRow, RowAction, RowCopyMeta, SPINNER};
+
+/// 读取工具首次点击展开时的默认预览视觉行数。
+pub(super) const READ_PREVIEW_INITIAL_LINES: usize = 24;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_tool(
@@ -128,25 +135,48 @@ pub(super) fn build_tool(
         .saturating_sub(5 + stat_w)
         .max(8) as u16;
     let exec_command = extract_command_text(name, kind, title, raw_input);
+    let exec_used_prefix = 2 + kind_label.width() + 3 + 2;
+    let exec_cmd_room = usize::from(width)
+        .saturating_sub(exec_used_prefix + stat_w + fold_mark.width())
+        .max(8);
+    // 多行命令或单行超出标题宽度的命令在展开体中完整渲染，避免标题行与正文首行重复出现
+    let exec_needs_body = exec_command.as_deref().is_some_and(|cmd| {
+        let line_count = cmd.lines().filter(|l| !l.trim().is_empty()).count();
+        line_count > 1 || cmd.trim().width() > exec_cmd_room
+    });
     let mut header_spans = if let Some(cmd) = exec_command.as_deref() {
-        let one_line_cmd = cmd.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ; ");
         let verb_style = if status == "failed" || status == "error" {
             theme::error()
         } else {
             theme::model()
         };
-        let mut spans = vec![
-            Span::styled(format!("{icon} "), icon_style),
-            Span::styled(kind_label.to_string(), verb_style),
-            Span::styled(" · ", theme::faint()),
-            Span::styled("$ ", theme::picked()),
-        ];
-        let used_prefix = 2 + kind_label.width() + 3 + 2;
-        let cmd_room = usize::from(width)
-            .saturating_sub(used_prefix + stat_w + fold_mark.width())
-            .max(8);
-        spans.extend(clip_highlighted_shell(&one_line_cmd, cmd_room));
-        spans
+        if expanded && exec_needs_body {
+            let line_count = cmd.lines().filter(|l| !l.trim().is_empty()).count();
+            let mut spans = vec![
+                Span::styled(format!("{icon} "), icon_style),
+                Span::styled(kind_label.to_string(), verb_style),
+            ];
+            if line_count > 1 {
+                spans.push(Span::styled(" · ", theme::faint()));
+                spans.push(Span::styled(format!("{line_count} 行命令"), theme::dim()));
+            }
+            spans
+        } else {
+            let one_line_cmd = cmd
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ; ");
+            let mut spans = vec![
+                Span::styled(format!("{icon} "), icon_style),
+                Span::styled(kind_label.to_string(), verb_style),
+                Span::styled(" · ", theme::faint()),
+                Span::styled("$ ", theme::picked()),
+            ];
+            spans.extend(clip_highlighted_shell(&one_line_cmd, exec_cmd_room));
+            spans
+        }
     } else {
         vec![
             Span::styled(format!("{icon} "), icon_style),
@@ -160,6 +190,7 @@ pub(super) fn build_tool(
         entry_id,
         spans: header_spans,
         links: Vec::new(),
+        buttons: Vec::new(),
         action: if has_detail { RowAction::Toggle } else { RowAction::None },
         copy_meta: RowCopyMeta::default(),
     });
@@ -172,15 +203,19 @@ pub(super) fn build_tool(
     let limit = |section, base| transcript.fold_reveal(entry_id, section).effective_limit(base);
     let output_limit = |base| (FoldSection::ToolOutput, limit(FoldSection::ToolOutput, base));
 
-    // 1. 若有结构化 Diff，展开后展示 `sai` 风格语法高亮 + 行内差异强调 Diff
+    // 1. 若有结构化 Diff，展开后展示语法高亮 + 行内差异强调，正文行只读，底部统一提供收起条
     if !computed_diffs.is_empty() {
         let multi_file = computed_diffs.len() > 1;
+        let trimmed_out = output.trim();
+        let has_trailing_output = !trimmed_out.is_empty();
+        let last_diff_idx = computed_diffs.len() - 1;
         for (idx, (td, computed)) in computed_diffs.iter().enumerate() {
             if idx > 0 {
                 out.push(RenderRow {
                     entry_id,
                     spans: Vec::new(),
                     links: Vec::new(),
+                    buttons: Vec::new(),
                     action: RowAction::Toggle,
                     copy_meta: RowCopyMeta::default(),
                 });
@@ -188,10 +223,8 @@ pub(super) fn build_tool(
             if !td.path.is_empty() {
                 let path_shown = linebreak::clip(&td.path, inner_w.saturating_sub(14) as u16);
                 let path_w = u16::try_from(path_shown.width()).unwrap_or(0);
-                let mut sub = vec![
-                    Span::styled(" • ", theme::faint()),
-                    Span::styled(path_shown, theme::md_url()),
-                ];
+                let mut sub = vec![Span::styled(" • ", theme::faint())];
+                sub.extend(crate::markdown::path_style::style_path_spans(&path_shown));
                 if multi_file {
                     sub.push(Span::styled(" (", theme::faint()));
                     sub.push(Span::styled(format!("+{}", computed.added), theme::added()));
@@ -203,10 +236,12 @@ pub(super) fn build_tool(
                     entry_id,
                     spans: sub,
                     links: vec![(3, 3 + path_w, td.path.clone())],
+                    buttons: Vec::new(),
                     action: RowAction::Toggle,
                     copy_meta: RowCopyMeta::default(),
                 });
             }
+            let is_bottom_slot = idx == last_diff_idx && !has_trailing_output;
             if computed.rows.is_empty() {
                 out.push(RenderRow {
                     entry_id,
@@ -215,9 +250,13 @@ pub(super) fn build_tool(
                         Span::styled("(无文本变更)", theme::faint()),
                     ],
                     links: Vec::new(),
+                    buttons: Vec::new(),
                     action: RowAction::Toggle,
                     copy_meta: RowCopyMeta::default(),
                 });
+                if is_bottom_slot {
+                    out.push(fold::collapse_bar(entry_id));
+                }
             } else {
                 let section = FoldSection::ToolDiff(idx);
                 let cap = limit(section, diff::DIFF_EXPANDED_MAX_VISUAL_LINES);
@@ -227,43 +266,73 @@ pub(super) fn build_tool(
                         entry_id,
                         spans,
                         links: Vec::new(),
+                        buttons: Vec::new(),
                         action: RowAction::Toggle,
                         copy_meta: RowCopyMeta::default(),
                     });
                 }
-                if omitted > 0 {
-                    out.push(fold::marker(entry_id, section, omitted));
+                if let Some(bar) = fold::action_bar(
+                    entry_id,
+                    ActionBarOptions {
+                        fold: (omitted > 0).then_some((section, omitted)),
+                        show_full_file: false,
+                        show_collapse: is_bottom_slot,
+                    },
+                ) {
+                    out.push(bar);
                 }
             }
         }
-        let trimmed_out = output.trim();
-        if !trimmed_out.is_empty() {
-            push_detail_lines(entry_id, trimmed_out, theme::dim(), inner_w, output_limit(12), out);
+        if has_trailing_output {
+            push_detail_lines(
+                entry_id,
+                trimmed_out,
+                theme::dim(),
+                inner_w,
+                output_limit(12),
+                true,
+                out,
+            );
         }
         return;
     }
 
-    // 2. 文件读取工具：与 Diff 一致的点击展开逻辑 + 参考 `sai/read_file.rs` 的带行号语法高亮代码预览
+    // 2. 文件读取工具：默认展开 24 行预览，支持渐进展开、查看完整文件与底部收起
     if is_read_tool {
         let path_str = read_path.as_deref().unwrap_or("");
         if !path_str.is_empty() {
             let path_shown = linebreak::clip(path_str, inner_w.saturating_sub(4) as u16);
             let path_w = u16::try_from(path_shown.width()).unwrap_or(0);
+            let mut spans = vec![Span::styled(" • ", theme::faint())];
+            spans.extend(crate::markdown::path_style::style_path_spans(&path_shown));
             out.push(RenderRow {
                 entry_id,
-                spans: vec![
-                    Span::styled(" • ", theme::faint()),
-                    Span::styled(path_shown, theme::md_url()),
-                ],
+                spans,
                 links: vec![(3, 3 + path_w, path_str.to_string())],
+                buttons: Vec::new(),
                 action: RowAction::Toggle,
                 copy_meta: RowCopyMeta::default(),
             });
         }
-        if let Some(preview) = build_read_preview(output, path_str, raw_input) {
-            push_read_preview_rows(entry_id, &preview, width, limit(FoldSection::ToolReadPreview, 160), out);
+        let full_file = transcript.is_read_full_file(entry_id);
+        if let Some(preview) = build_read_preview(output, path_str, raw_input, full_file, cache) {
+            push_read_preview_rows(
+                entry_id,
+                &preview,
+                width,
+                limit(FoldSection::ToolReadPreview, READ_PREVIEW_INITIAL_LINES),
+                out,
+            );
         } else if !output.trim().is_empty() {
-            push_detail_lines(entry_id, output.trim(), theme::dim(), inner_w, output_limit(40), out);
+            push_detail_lines(
+                entry_id,
+                output.trim(),
+                theme::dim(),
+                inner_w,
+                output_limit(READ_PREVIEW_INITIAL_LINES),
+                true,
+                out,
+            );
         } else {
             out.push(RenderRow {
                 entry_id,
@@ -272,26 +341,61 @@ pub(super) fn build_tool(
                     Span::styled("(无预览内容)", theme::faint()),
                 ],
                 links: Vec::new(),
+                buttons: Vec::new(),
                 action: RowAction::Toggle,
                 copy_meta: RowCopyMeta::default(),
             });
+            out.push(fold::collapse_bar(entry_id));
         }
         return;
     }
 
-    // 3. 普通工具（命令执行、搜索等）
+    // 3. 普通工具（命令执行、搜索等）：短单行命令已在标题完整展示，避免展开后首行重复
+    let trimmed_out = output.trim();
+    let has_output = !trimmed_out.is_empty();
+    let mut emitted_bottom_collapse = false;
     if let Some(cmd) = exec_command {
-        push_highlighted_command_lines(entry_id, &cmd, inner_w, limit(FoldSection::ToolCommand, 8), out);
+        if exec_needs_body {
+            push_highlighted_command_lines(
+                entry_id,
+                &cmd,
+                inner_w,
+                limit(FoldSection::ToolCommand, 8),
+                !has_output,
+                out,
+            );
+            emitted_bottom_collapse = !has_output;
+        }
     } else if let Some(input) = raw_input
         && let Some(path) = input["Path"]
             .as_str()
             .or_else(|| input["path"].as_str())
-        {
-            let section = FoldSection::ToolPath;
-            push_detail_lines(entry_id, path, theme::md_url(), inner_w, (section, limit(section, 2)), out);
-        }
-    let trimmed_out = output.trim();
-    if !trimmed_out.is_empty() {
-        push_detail_lines(entry_id, trimmed_out, theme::dim(), inner_w, output_limit(24), out);
+    {
+        let section = FoldSection::ToolPath;
+        push_detail_lines(
+            entry_id,
+            path,
+            theme::md_url(),
+            inner_w,
+            (section, limit(section, 2)),
+            !has_output,
+            out,
+        );
+        emitted_bottom_collapse = !has_output;
+    }
+    if has_output {
+        push_detail_lines(
+            entry_id,
+            trimmed_out,
+            theme::dim(),
+            inner_w,
+            output_limit(24),
+            true,
+            out,
+        );
+        emitted_bottom_collapse = true;
+    }
+    if !emitted_bottom_collapse {
+        out.push(fold::collapse_bar(entry_id));
     }
 }

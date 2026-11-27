@@ -45,6 +45,7 @@ impl App {
                 // 历史回放完成后重置后台任务与异步续答状态，避免将旧会话记录误判为运行中
                 self.pending_resume = None;
                 self.background.clear();
+                self.todo_call_ids.clear();
                 self.async_turn_last_event = None;
                 self.async_turn_saw_usage = false;
                 self.transcript.session_id = Some(session_id.clone());
@@ -136,6 +137,7 @@ impl App {
                 self.elicitation = None;
                 self.background.clear();
                 self.subagents.clear();
+                self.todo_call_ids.clear();
                 self.transcript.push_notice(reason.clone(), true);
                 self.toast(reason, true);
             }
@@ -172,6 +174,21 @@ impl App {
                 output,
                 diffs,
             } => {
+                // 【任务清单】【拦截工具调用】将 agy `update_steps` 及同类 Todo 工具转为结构化任务清单，避免生成空白工具行
+                if crate::todo::is_todo_tool(&name) {
+                    if !call_id.is_empty() {
+                        self.todo_call_ids.insert(call_id);
+                    }
+                    if let Some(items) =
+                        crate::todo::extract_plan_items_from_tool(&name, raw_input.as_ref())
+                    {
+                        if !items.is_empty() {
+                            self.mark_async_turn_activity();
+                        }
+                        self.transcript.update_plan(items);
+                    }
+                    return;
+                }
                 let is_active = !matches!(
                     status.trim().to_ascii_lowercase().as_str(),
                     "completed" | "failed" | "error" | "cancelled" | "canceled" | "done" | "succeeded"
@@ -226,6 +243,26 @@ impl App {
                         "completed" | "failed" | "error" | "cancelled" | "canceled" | "done" | "succeeded"
                     )
                 });
+                // 【任务清单】【拦截增量更新】处理延迟回传 `rawInput` 的 Todo 工具更新事件
+                let matched_todo = name
+                    .as_deref()
+                    .is_some_and(crate::todo::is_todo_tool)
+                    || (!call_id.is_empty() && self.todo_call_ids.contains(&call_id));
+                if matched_todo {
+                    if !call_id.is_empty() {
+                        self.todo_call_ids.insert(call_id);
+                    }
+                    let tool_name = name.as_deref().unwrap_or("update_steps");
+                    if let Some(items) =
+                        crate::todo::extract_plan_items_from_tool(tool_name, raw_input.as_ref())
+                    {
+                        if !items.is_empty() {
+                            self.mark_async_turn_activity();
+                        }
+                        self.transcript.update_plan(items);
+                    }
+                    return;
+                }
                 if !is_terminal {
                     self.mark_async_turn_activity();
                 }

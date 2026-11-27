@@ -1,6 +1,7 @@
 //! 正文时间线行构建器与 Markdown 宽度缓存。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -11,14 +12,17 @@ use crate::acp::ToolDiff;
 use crate::diff;
 use crate::linebreak;
 use crate::markdown::{self, MdLine};
-use crate::theme::{self, ThemePreset};
+use crate::theme;
 use crate::transcript::{Entry, EntryKind, FoldSection, Transcript, format_duration, format_short};
 
 mod fold;
+mod plan;
+mod read_preview;
 mod subagent;
 mod tool;
 mod tool_meta;
 
+pub use fold::{InlineAction, InlineButton};
 use tool::build_tool;
 
 pub(super) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -38,6 +42,7 @@ pub struct RenderRow {
     pub entry_id: u64,
     pub spans: Vec<Span<'static>>,
     pub links: Vec<(u16, u16, String)>,
+    pub buttons: Vec<InlineButton>,
     pub action: RowAction,
     pub copy_meta: RowCopyMeta,
 }
@@ -53,8 +58,7 @@ pub enum RowAction {
 struct CacheKey {
     entry_id: u64,
     width: u16,
-    preset: u8,
-    paint_bg: bool,
+    theme_revision: u64,
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -67,6 +71,7 @@ pub struct MdCache {
     entries: HashMap<CacheKey, (usize, Vec<MdLine>)>,
     thoughts: HashMap<ThoughtCacheKey, (usize, Vec<String>)>,
     diffs: HashMap<(u64, usize), (usize, usize, diff::ComputedDiff)>,
+    read_files: HashMap<String, Option<Arc<Vec<String>>>>,
 }
 
 impl MdCache {
@@ -75,7 +80,31 @@ impl MdCache {
             entries: HashMap::new(),
             thoughts: HashMap::new(),
             diffs: HashMap::new(),
+            read_files: HashMap::new(),
         }
+    }
+
+    /// 读取并缓存本地文件按行切分结果，避免读取预览在每帧重绘时重复读盘。
+    ///
+    /// 参数:
+    /// - `path`: 本地文件路径
+    ///
+    /// 返回:
+    /// - 文件可读且不超过 2MB 时返回按行切分的共享切片
+    pub(super) fn read_local_file(&mut self, path: &str) -> Option<Arc<Vec<String>>> {
+        if let Some(cached) = self.read_files.get(path) {
+            return cached.clone();
+        }
+        if self.read_files.len() > 128 {
+            self.read_files.clear();
+        }
+        let loaded = std::fs::metadata(path)
+            .ok()
+            .filter(|m| m.is_file() && m.len() <= 2 * 1024 * 1024)
+            .and_then(|_| std::fs::read_to_string(path).ok())
+            .map(|content| Arc::new(content.lines().map(String::from).collect()));
+        self.read_files.insert(path.to_string(), loaded.clone());
+        loaded
     }
 
     /// 渲染或命中缓存的 Markdown 行集合（同一 entry 流式增长时原地覆盖，避免清空历史缓存）。
@@ -91,8 +120,7 @@ impl MdCache {
         let key = CacheKey {
             entry_id,
             width,
-            preset: preset_id(theme::current_preset()),
-            paint_bg: theme::paint_bg(),
+            theme_revision: theme::revision(),
         };
         if self.entries.len() > 512 && !self.entries.contains_key(&key) {
             self.entries.clear();
@@ -178,17 +206,6 @@ impl MdCache {
     }
 }
 
-fn preset_id(p: ThemePreset) -> u8 {
-    match p {
-        ThemePreset::MiyuLavender => 0,
-        ThemePreset::MiyuNight => 1,
-        ThemePreset::MiyuForest => 2,
-        ThemePreset::MiyuDay => 3,
-        ThemePreset::MiyuPaper => 4,
-        ThemePreset::Terminal => 5,
-    }
-}
-
 pub struct BuiltBody {
     pub rows: Vec<RenderRow>,
     pub entry_starts: HashMap<u64, usize>,
@@ -198,6 +215,7 @@ pub fn build_body(
     transcript: &Transcript,
     subagents: &[crate::subagent::Agent],
     width: u16,
+    busy: bool,
     tick: usize,
     cache: &mut MdCache,
 ) -> BuiltBody {
@@ -266,7 +284,9 @@ pub fn build_body(
             EntryKind::Assistant { done_line } => {
                 build_assistant(entry, done_line.as_deref(), width, cache, &mut rows)
             }
-            EntryKind::Plan(items) => build_plan(entry.id, items, width, &mut rows),
+            EntryKind::Plan { items, expanded } => {
+                plan::build_plan(entry.id, items, *expanded, width, busy, tick, &mut rows)
+            }
             EntryKind::Notice { is_error } => build_notice(entry, *is_error, width, &mut rows),
         }
     }
@@ -288,6 +308,7 @@ fn build_user(
         entry_id: entry.id,
         spans: vec![bar.clone()],
         links: Vec::new(),
+        buttons: Vec::new(),
         action: RowAction::None,
         copy_meta: RowCopyMeta {
             content_left: 2,
@@ -312,6 +333,7 @@ fn build_user(
                 entry_id: entry.id,
                 spans,
                 links: line_links,
+                buttons: Vec::new(),
                 action: RowAction::None,
                 copy_meta: RowCopyMeta {
                     content_left: 2,
@@ -325,6 +347,7 @@ fn build_user(
         entry_id: entry.id,
         spans: vec![bar],
         links: Vec::new(),
+        buttons: Vec::new(),
         action: RowAction::None,
         copy_meta: RowCopyMeta {
             content_left: 2,
@@ -415,6 +438,7 @@ fn build_thought(
             Span::styled(hint, theme::faint()),
         ],
         links: Vec::new(),
+        buttons: Vec::new(),
         action: RowAction::Toggle,
         copy_meta: RowCopyMeta::default(),
     });
@@ -434,7 +458,16 @@ fn build_thought(
     };
 
     if !expanded && wrapped.len() > preview_limit {
-        out.push(fold::marker(entry.id, FoldSection::Thought, wrapped.len() - preview_limit));
+        if let Some(bar) = fold::action_bar(
+            entry.id,
+            fold::ActionBarOptions {
+                fold: Some((FoldSection::Thought, wrapped.len() - preview_limit)),
+                show_full_file: false,
+                show_collapse: false,
+            },
+        ) {
+            out.push(bar);
+        }
     }
 
     for line in shown {
@@ -445,6 +478,7 @@ fn build_thought(
                 Span::styled(line.clone(), theme::thought()),
             ],
             links: Vec::new(),
+            buttons: Vec::new(),
             action: RowAction::Toggle,
             copy_meta: RowCopyMeta {
                 content_left: 2,
@@ -452,6 +486,11 @@ fn build_thought(
                 join_previous: false,
             },
         });
+    }
+
+    // 思考块处于展开状态且超过默认 3 行折叠预览时，在底部提供统一收起按钮
+    if (expanded || preview_limit > 3) && wrapped.len() > 3 {
+        out.push(fold::collapse_bar(entry.id));
     }
 }
 
@@ -479,6 +518,7 @@ fn build_assistant(
             entry_id: entry.id,
             spans: line.to_spans(),
             links,
+            buttons: Vec::new(),
             action: RowAction::None,
             copy_meta: RowCopyMeta {
                 content_left: line.content_offset,
@@ -499,45 +539,7 @@ fn build_assistant(
                 theme::faint(),
             )],
             links: Vec::new(),
-            action: RowAction::None,
-            copy_meta: RowCopyMeta::default(),
-        });
-    }
-}
-
-fn build_plan(
-    entry_id: u64,
-    items: &[crate::acp::PlanItem],
-    width: u16,
-    out: &mut Vec<RenderRow>,
-) {
-    if items.is_empty() {
-        return;
-    }
-    out.push(RenderRow {
-        entry_id,
-        spans: vec![Span::styled("◈ 任务计划", theme::side_title())],
-        links: Vec::new(),
-        action: RowAction::None,
-        copy_meta: RowCopyMeta::default(),
-    });
-    for item in items {
-        let (mark, style) = match item.status.as_str() {
-            "completed" | "done" => ("☑ ", theme::good()),
-            "in_progress" => ("◐ ", theme::accent()),
-            _ => ("☐ ", theme::dim()),
-        };
-        out.push(RenderRow {
-            entry_id,
-            spans: vec![
-                Span::styled("  ", Style::new()),
-                Span::styled(mark, style),
-                Span::styled(
-                    linebreak::clip(&item.content, width.saturating_sub(4)),
-                    theme::text(),
-                ),
-            ],
-            links: Vec::new(),
+            buttons: Vec::new(),
             action: RowAction::None,
             copy_meta: RowCopyMeta::default(),
         });
@@ -559,6 +561,7 @@ fn build_notice(entry: &Entry, is_error: bool, width: u16, out: &mut Vec<RenderR
                     Span::styled(cells[r].concat(), style),
                 ],
                 links: Vec::new(),
+                buttons: Vec::new(),
                 action: RowAction::None,
                 copy_meta: RowCopyMeta::default(),
             });
@@ -571,6 +574,7 @@ fn blank_row(entry_id: u64) -> RenderRow {
         entry_id,
         spans: Vec::new(),
         links: Vec::new(),
+        buttons: Vec::new(),
         action: RowAction::None,
         copy_meta: RowCopyMeta::default(),
     }

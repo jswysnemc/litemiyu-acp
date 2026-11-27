@@ -1,6 +1,6 @@
 //! 会话对话记录与格式化工具。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
@@ -52,7 +52,10 @@ pub enum EntryKind {
     Assistant {
         done_line: Option<String>,
     },
-    Plan(Vec<PlanItem>),
+    Plan {
+        items: Vec<PlanItem>,
+        expanded: bool,
+    },
     Notice {
         is_error: bool,
     },
@@ -69,6 +72,8 @@ pub struct Transcript {
     pub session_id: Option<String>,
     pub title: Option<String>,
     pub entries: Vec<Entry>,
+    pub latest_plan: Vec<PlanItem>,
+    pub latest_plan_entry_id: Option<u64>,
     pub context_used: u64,
     pub context_window: u64,
     pub total_input: u64,
@@ -78,6 +83,7 @@ pub struct Transcript {
     pub turn_first_token: Option<Instant>,
     turn_stream_chunks: usize,
     fold_reveals: HashMap<(u64, FoldSection), FoldReveal>,
+    full_file_reads: HashSet<u64>,
     next_id: u64,
 }
 
@@ -87,6 +93,8 @@ impl Transcript {
             session_id: None,
             title: None,
             entries: Vec::new(),
+            latest_plan: Vec::new(),
+            latest_plan_entry_id: None,
             context_used: 0,
             context_window: 0,
             total_input: 0,
@@ -96,12 +104,15 @@ impl Transcript {
             turn_first_token: None,
             turn_stream_chunks: 0,
             fold_reveals: HashMap::new(),
+            full_file_reads: HashSet::new(),
             next_id: 1,
         }
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.latest_plan.clear();
+        self.latest_plan_entry_id = None;
         self.title = None;
         self.context_used = 0;
         self.total_input = 0;
@@ -111,6 +122,7 @@ impl Transcript {
         self.turn_first_token = None;
         self.turn_stream_chunks = 0;
         self.fold_reveals.clear();
+        self.full_file_reads.clear();
     }
 
     /// 标记新回合开始，重置首字延迟与流式输出块计数。
@@ -291,17 +303,51 @@ impl Transcript {
         id
     }
 
+    /// 更新当前会话的任务清单：同步持久化最新状态，并在当前回合内原地更新已有任务卡片避免刷屏。
+    ///
+    /// 参数:
+    /// - `items`: 最新的完整任务步骤列表
     pub fn update_plan(&mut self, items: Vec<PlanItem>) {
-        if let Some(last) = self.entries.last_mut()
-            && let EntryKind::Plan(existing) = &mut last.kind {
+        self.latest_plan = items.clone();
+        if items.is_empty() {
+            self.latest_plan_entry_id = None;
+            // 1. 收到空任务清单时同步移除当前回合已有的任务卡片，避免正文与底栏状态不一致
+            let mut remove_idx = None;
+            for (idx, e) in self.entries.iter().enumerate().rev() {
+                if matches!(e.kind, EntryKind::User { .. }) {
+                    break;
+                }
+                if matches!(e.kind, EntryKind::Plan { .. }) {
+                    remove_idx = Some(idx);
+                    break;
+                }
+            }
+            if let Some(idx) = remove_idx {
+                self.entries.remove(idx);
+            }
+            return;
+        }
+        // 2. 若当前回合（最近一条用户消息之后）已存在任务卡片，则原地更新内容，不重复堆叠多张清单
+        for e in self.entries.iter_mut().rev() {
+            if matches!(e.kind, EntryKind::User { .. }) {
+                break;
+            }
+            if let EntryKind::Plan { items: existing, .. } = &mut e.kind {
                 *existing = items;
+                self.latest_plan_entry_id = Some(e.id);
                 return;
             }
+        }
+        // 3. 当前回合首次出现任务清单时新建单行折叠卡片（完整清单固定展示在底部任务栏）
         let id = self.alloc_id();
+        self.latest_plan_entry_id = Some(id);
         self.entries.push(Entry {
             id,
             text: String::new(),
-            kind: EntryKind::Plan(items),
+            kind: EntryKind::Plan {
+                items,
+                expanded: false,
+            },
         });
     }
 
@@ -430,7 +476,9 @@ impl Transcript {
         for e in &mut self.entries {
             if e.id == id {
                 match &mut e.kind {
-                    EntryKind::Thought { expanded, .. } | EntryKind::Tool { expanded, .. } => {
+                    EntryKind::Thought { expanded, .. }
+                    | EntryKind::Tool { expanded, .. }
+                    | EntryKind::Plan { expanded, .. } => {
                         *expanded = expand;
                         matched = true;
                     }
@@ -491,7 +539,7 @@ impl Transcript {
                         matched = true;
                         break;
                     }
-                    EntryKind::Tool { expanded, .. } => {
+                    EntryKind::Tool { expanded, .. } | EntryKind::Plan { expanded, .. } => {
                         *expanded = !*expanded;
                         collapsed = !*expanded;
                         matched = true;
@@ -509,6 +557,7 @@ impl Transcript {
 
     pub fn toggle_all_details(&mut self, expand: bool) {
         self.fold_reveals.clear();
+        self.full_file_reads.clear();
         for e in &mut self.entries {
             match &mut e.kind {
                 EntryKind::Thought { expanded, .. } => *expanded = expand,

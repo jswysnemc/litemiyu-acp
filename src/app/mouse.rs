@@ -3,7 +3,8 @@
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 use crate::clipboard;
-use crate::ui::{HoverTarget, TextSelection};
+use crate::ui::overlay::PickerKind;
+use crate::ui::{HomeAction, HoverTarget, TextSelection};
 
 use super::App;
 
@@ -16,27 +17,8 @@ impl App {
     /// 返回:
     /// - 界面状态实际发生变化（需要重绘）时返回 `true`，空白区移动等无效事件返回 `false`
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
-        if self.picker.is_some() || self.permission.is_some() || self.elicitation.is_some() {
-            let cleared = self.hover != HoverTarget::None;
-            self.hover = HoverTarget::None;
-            if self.picker.is_some() {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        if let Some(p) = &mut self.picker {
-                            p.move_up();
-                        }
-                        return true;
-                    }
-                    MouseEventKind::ScrollDown => {
-                        if let Some(p) = &mut self.picker {
-                            p.move_down();
-                        }
-                        return true;
-                    }
-                    _ => {}
-                }
-            }
-            return cleared;
+        if let Some(redraw) = self.handle_overlay_mouse(mouse) {
+            return redraw;
         }
 
         match mouse.kind {
@@ -157,16 +139,47 @@ impl App {
     /// 返回:
     /// - 命中的紧凑 `HoverTarget`，未命中返回 `HoverTarget::None`
     fn resolve_hover_target(&self, col: u16, row: u16) -> HoverTarget {
-        // 1. 底部「回到底部」按钮与底栏用量单元格
+        // 0. 启动首页可点击快捷项与最近会话列表
+        if let Some((idx, (_, action))) = self
+            .last_hits
+            .home
+            .actions
+            .iter()
+            .enumerate()
+            .find(|(_, (rect, _))| rect_contains(*rect, col, row))
+        {
+            return HoverTarget::HomeAction(idx, *action);
+        }
+        if let Some((_, _, sid)) = self
+            .last_hits
+            .home
+            .sessions
+            .iter()
+            .find(|(_, rect, _)| rect_contains(*rect, col, row))
+        {
+            return HoverTarget::HomeSession(sid.clone());
+        }
+        // 1. 顶部黏性用户条、底部停靠任务条、「回到底部」按钮与底栏用量单元格
+        if let Some(eid) = self.last_hits.sticky_prompt.entry_id
+            && rect_contains(self.last_hits.sticky_prompt.area, col, row)
+        {
+            return HoverTarget::StickyUserPrompt(eid);
+        }
+        if rect_contains(self.last_hits.todo_bar_toggle, col, row) {
+            return HoverTarget::TodoBarToggle;
+        }
         if rect_contains(self.last_hits.bottom_button, col, row) {
             return HoverTarget::BottomButton;
         }
         if rect_contains(self.last_hits.usage_cell, col, row) {
             return HoverTarget::UsageCell;
         }
-        // 2. 右侧边栏紧凑交互项（后台任务、上下文进度区、跳转消息、最近会话）
+        // 2. 右侧边栏紧凑交互项（任务清单、子代理、后台任务、上下文进度区、跳转消息、最近会话）
         let side = &self.last_hits.sidebar;
         if side.area.width > 0 && col >= side.area.x && col < side.area.right() {
+            if rect_contains(side.todo_area, col, row) {
+                return HoverTarget::SidebarTodo;
+            }
             if let Some((_, entry)) = side.subagent_rows.iter().find(|(screen_y, _)| *screen_y == row) {
                 return HoverTarget::SidebarSubagent(*entry);
             }
@@ -184,11 +197,23 @@ impl App {
             }
             return HoverTarget::None;
         }
-        // 3. 【正文】【折叠提示】仅命中实际提示行，避免覆盖工具标题与滚动条
+        // 3. 【正文】【操作按钮】精确命中折叠展开、查看完整文件或底部收起按钮（无背景，仅文字高亮）
         if rect_contains(self.last_hits.body_text, col, row)
-            && let Some(&(entry, section)) = self.last_hits.fold_rows.get(&row)
+            && let Some((entry_id, buttons)) = self.last_hits.inline_buttons.get(&row)
         {
-            return HoverTarget::Fold(entry, section);
+            let rel_col = col.saturating_sub(self.last_hits.body.x);
+            if let Some(btn) = buttons
+                .iter()
+                .find(|b| rel_col >= b.col_start && rel_col < b.col_end)
+            {
+                return HoverTarget::InlineButton {
+                    row,
+                    col_start: self.last_hits.body.x.saturating_add(btn.col_start),
+                    col_end: self.last_hits.body.x.saturating_add(btn.col_end),
+                    entry_id: *entry_id,
+                    action: btn.action,
+                };
+            }
         }
         if col >= self.last_hits.body.x && col < self.last_hits.body.right() {
             let rel_col = col.saturating_sub(self.last_hits.body.x);
@@ -251,6 +276,63 @@ impl App {
     }
 
     fn handle_left_click(&mut self, col: u16, row: u16) {
+        // 0. 启动首页快捷操作与最近会话直达恢复
+        if let Some((_, action)) = self
+            .last_hits
+            .home
+            .actions
+            .iter()
+            .find(|(rect, _)| rect_contains(*rect, col, row))
+            .copied()
+        {
+            match action {
+                HomeAction::Model => self.open_config_picker("model", "选择模型", PickerKind::Model),
+                HomeAction::Effort => {
+                    self.open_config_picker("thought_level", "选择思考等级", PickerKind::Effort)
+                }
+                HomeAction::Mode => self.open_mode_picker(),
+                HomeAction::Resume => self.open_resume_picker(),
+                HomeAction::Theme => self.open_theme_picker(),
+                HomeAction::Help => self.open_help_picker(),
+            }
+            return;
+        }
+        if let Some((_, _, sid)) = self
+            .last_hits
+            .home
+            .sessions
+            .iter()
+            .find(|(_, rect, _)| rect_contains(*rect, col, row))
+            .cloned()
+        {
+            self.load_session(sid);
+            return;
+        }
+        // 0.4 顶部黏性上条用户消息点击展开并跳转至完整用户消息位置
+        if let Some(eid) = self.last_hits.sticky_prompt.entry_id
+            && rect_contains(self.last_hits.sticky_prompt.area, col, row)
+        {
+            if let Some(&start) = self.last_hits.entry_starts.get(&eid) {
+                self.scroll = start;
+                self.auto_follow = false;
+            }
+            return;
+        }
+        // 0.5 底部停靠任务条点击切换展开/收起
+        if rect_contains(self.last_hits.todo_bar_toggle, col, row) {
+            self.toggle_todo_bar();
+            return;
+        }
+        if let HoverTarget::SidebarTodo = self.resolve_hover_target(col, row) {
+            if let Some(entry_id) = self.last_hits.sidebar.todo_entry_id {
+                self.transcript.set_entry_expanded(entry_id, true);
+                if let Some(&start) = self.last_hits.entry_starts.get(&entry_id) {
+                    self.scroll = start;
+                    self.auto_follow = false;
+                }
+            }
+            return;
+        }
         if let HoverTarget::SidebarSubagent(entry) = self.resolve_hover_target(col, row) {
             self.transcript.set_entry_expanded(entry, true);
             if let Some(start) = self.last_hits.entry_starts.get(&entry) {
@@ -259,7 +341,7 @@ impl App {
             }
             return;
         }
-        if self.reveal_fold_at(col, row, false) {
+        if self.click_inline_button_at(col, row) {
             return;
         }
         // 0. 点击「回到底部」/ 底栏用量格 / 侧边栏上下文进度条
@@ -344,7 +426,57 @@ impl App {
     }
 
 
-    /// 【正文】【展开折叠行】按屏幕坐标展开分区，`all` 决定是否全部展开，返回是否命中。
+    /// 【正文】【执行操作条按钮】按屏幕坐标命中并触发行内展开/查看完整文件/收起按钮。
+    fn click_inline_button_at(&mut self, col: u16, row: u16) -> bool {
+        if !rect_contains(self.last_hits.body_text, col, row) {
+            return false;
+        }
+        let Some((entry_id, buttons)) = self.last_hits.inline_buttons.get(&row).cloned() else {
+            return false;
+        };
+        let rel_col = col.saturating_sub(self.last_hits.body.x);
+        let Some(btn) = buttons
+            .iter()
+            .find(|b| rel_col >= b.col_start && rel_col < b.col_end)
+        else {
+            return false;
+        };
+
+        // 1. 固定视口起点，避免展开或收起时将当前阅读位置推离屏幕
+        if self.auto_follow {
+            self.scroll = self
+                .last_hits
+                .total_body_rows
+                .saturating_sub(self.last_hits.visible_body_rows);
+        }
+        self.auto_follow = false;
+        self.selection = None;
+        self.hover = HoverTarget::None;
+
+        // 2. 按按钮语义执行对应操作
+        match btn.action {
+            crate::ui::rows::InlineAction::RevealStep { section, step } => {
+                self.transcript.reveal_fold_by(entry_id, section, step, false);
+            }
+            crate::ui::rows::InlineAction::RevealAll { section } => {
+                self.transcript.reveal_fold(entry_id, section, true);
+            }
+            crate::ui::rows::InlineAction::ReadFullFile => {
+                self.transcript.enable_read_full_file(entry_id);
+            }
+            crate::ui::rows::InlineAction::CollapseEntry => {
+                self.transcript.set_entry_expanded(entry_id, false);
+                if let Some(&start) = self.last_hits.entry_starts.get(&entry_id)
+                    && self.scroll > start
+                {
+                    self.scroll = start;
+                }
+            }
+        }
+        true
+    }
+
+    /// 【正文】【展开折叠行】右键点击整条折叠行时展开该分区全部剩余内容。
     fn reveal_fold_at(&mut self, col: u16, row: u16, all: bool) -> bool {
         if !rect_contains(self.last_hits.body_text, col, row) {
             return false;
@@ -411,7 +543,7 @@ impl App {
 
 }
 
-fn rect_contains(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
+pub(super) fn rect_contains(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
     rect.width > 0
         && rect.height > 0
         && col >= rect.x

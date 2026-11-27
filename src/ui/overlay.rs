@@ -1,4 +1,4 @@
-//! 悬浮补全菜单、模态选择器（模型/思考等级/模式/历史会话/主题/帮助）与权限审批抽屉。
+//! 模态选择器（模型/思考等级/模式/历史会话/主题/状态/队列/帮助）状态与渲染模块。
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -7,7 +7,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use crate::acp::PermissionRequest;
 use crate::linebreak;
 use crate::theme;
 use crate::transcript::short_id;
@@ -15,6 +14,9 @@ pub use super::format::{
     format_compact_time, format_relative_time, parse_timestamp_secs, same_directory,
     shorten_path_left,
 };
+pub use super::overlay_drawers::{draw_completion_menu, draw_permission_drawer};
+use super::HoverTarget;
+use super::overlay_hits::{OverlayFooterAction, PickerHits, build_right_hint_line};
 
 #[derive(Debug, Clone)]
 pub struct PickerItem {
@@ -173,110 +175,14 @@ impl PickerState {
     }
 }
 
-use crate::completion::{CompletionKind, CompletionMenu};
-
-/// 绘制输入框上方的统一悬浮补全菜单（支持 `/` 命令、`#` Skills 与 `@` 工作区文件）。
-///
-/// 参数:
-/// - `frame`: 当前渲染帧
-/// - `input_frame`: 输入框外框区域
-/// - `menu`: 补全菜单快照
-/// - `selected`: 当前选中项索引
-pub fn draw_completion_menu(
+pub fn draw_picker(
     frame: &mut Frame,
-    input_frame: Rect,
-    menu: &CompletionMenu,
-    selected: usize,
-) {
-    let suggestions = &menu.items;
-    if suggestions.is_empty() || input_frame.y < 3 {
-        return;
-    }
-    let visible = suggestions.len().min(8);
-    let height = visible as u16 + 2;
-    let y = input_frame.y.saturating_sub(height);
-    let area = Rect::new(input_frame.x, y, input_frame.width, height);
-
-    let (title, hint) = match menu.kind {
-        CompletionKind::Command => (
-            format!(" 命令 ({}) ", suggestions.len()),
-            " ↑↓ 选择 · Tab 补全 · Enter 执行 · Esc 关闭 ",
-        ),
-        CompletionKind::Skill => (
-            format!(" Skills ({}) ", suggestions.len()),
-            " ↑↓ 选择 · Tab/Enter 插入 · Esc 关闭 ",
-        ),
-        CompletionKind::File => (
-            format!(" 工作区文件 ({}) ", suggestions.len()),
-            " ↑↓ 选择 · Tab/Enter 插入 · Esc 关闭 ",
-        ),
-    };
-
-    let p = theme::palette();
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme::faint())
-        .title_top(Line::styled(title, theme::accent()).left_aligned())
-        .title_top(Line::styled(hint, theme::faint()).right_aligned())
-        .style(Style::new().bg(p.panel_bg).fg(p.text));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let start = if selected >= visible {
-        selected + 1 - visible
-    } else {
-        0
-    };
-    let mut lines = Vec::new();
-    let max_w = usize::from(inner.width);
-    let label_cap = match menu.kind {
-        CompletionKind::File => 28,
-        CompletionKind::Command | CompletionKind::Skill => 24,
-    };
-    for (idx, item) in suggestions.iter().enumerate().skip(start).take(visible) {
-        let is_sel = idx == selected;
-        let clipped_label = linebreak::clip(&item.label, label_cap);
-        let label_w = clipped_label.width().max(16);
-        let pad_after_label = label_w.saturating_sub(clipped_label.width());
-        let desc_room = max_w.saturating_sub(label_w + 4);
-        let desc = linebreak::clip(&item.description, desc_room as u16);
-        let row_text = format!(" {}{}  {}", clipped_label, " ".repeat(pad_after_label), desc);
-
-        if is_sel {
-            let pad = max_w.saturating_sub(row_text.width());
-            lines.push(Line::styled(
-                format!("{row_text}{}", " ".repeat(pad)),
-                theme::picked_bar(),
-            ));
-        } else {
-            let label_style = match menu.kind {
-                CompletionKind::File => theme::md_url(),
-                CompletionKind::Skill => theme::picked(),
-                CompletionKind::Command => {
-                    if item.accent_primary {
-                        theme::accent()
-                    } else {
-                        theme::picked()
-                    }
-                }
-            };
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(clipped_label, label_style),
-                Span::raw(" ".repeat(pad_after_label + 2)),
-                Span::styled(desc, theme::dim()),
-            ]));
-        }
-    }
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-pub fn draw_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
+    area: Rect,
+    picker: &PickerState,
+    hover: &HoverTarget,
+) -> PickerHits {
     if picker.kind == PickerKind::Resume {
-        draw_resume_picker(frame, area, picker);
-        return;
+        return draw_resume_picker(frame, area, picker, hover);
     }
 
     let w = area.width.saturating_sub(6).clamp(36, 82);
@@ -286,6 +192,10 @@ pub fn draw_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
+    let mut hits = PickerHits {
+        popup,
+        ..PickerHits::default()
+    };
 
     let p = theme::palette();
     frame.render_widget(Clear, popup);
@@ -293,22 +203,43 @@ pub fn draw_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
         format!(" {} ", picker.title),
         theme::accent_bold(),
     )]);
-    let hint_line = Line::from(vec![Span::styled(
-        " ↑↓ 选择 · Enter 确认 · Esc 关闭 ",
-        theme::faint(),
-    )]);
+    let bottom_y = popup.bottom().saturating_sub(1);
+    let (hint_line, footer_actions) = if picker.kind == PickerKind::Help {
+        build_right_hint_line(
+            popup,
+            bottom_y,
+            &[
+                ("↑↓/滚轮 浏览 · ", None),
+                ("Esc/点外部 关闭", Some(OverlayFooterAction::Close)),
+            ],
+            hover,
+        )
+    } else {
+        build_right_hint_line(
+            popup,
+            bottom_y,
+            &[
+                ("↑↓/点击 选择 · ", None),
+                ("Enter 确认", Some(OverlayFooterAction::Confirm)),
+                (" · ", None),
+                ("Esc/点外部 关闭", Some(OverlayFooterAction::Close)),
+            ],
+            hover,
+        )
+    };
+    hits.footer_actions = footer_actions;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme::accent())
         .title_top(title_line)
-        .title_bottom(hint_line.right_aligned())
+        .title_bottom(hint_line)
         .style(Style::new().bg(p.panel_bg).fg(p.text));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
     if inner.height < 2 {
-        return;
+        return hits;
     }
 
     // 搜索栏（Help / Status / Queue 不需要搜索栏）
@@ -351,7 +282,7 @@ pub fn draw_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
 
     let visible = usize::from(list_area.height);
     if visible == 0 {
-        return;
+        return hits;
     }
     let sel = picker.selected.min(filtered.len().saturating_sub(1));
     let start = if sel >= visible { sel + 1 - visible } else { 0 };
@@ -361,26 +292,61 @@ pub fn draw_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
     if filtered.is_empty() {
         lines.push(Line::styled("  无匹配项", theme::dim()));
     } else {
-        for (i, (_, item)) in filtered.iter().enumerate().skip(start).take(visible) {
+        for (row_offset, (i, (_, item))) in filtered.iter().enumerate().skip(start).take(visible).enumerate() {
+            if picker.kind != PickerKind::Help {
+                hits.items.push((
+                    Rect::new(list_area.x, list_area.y + row_offset as u16, list_area.width, 1),
+                    i,
+                ));
+            }
             let is_sel = i == sel && picker.kind != PickerKind::Help;
             let mark = if item.active { "● " } else { "  " };
+            let swatches = if picker.kind == PickerKind::Theme {
+                theme::swatches_for_id(&item.id)
+            } else {
+                None
+            };
+            // 主题选择器在右侧绘制 5 色代表色块（宽屏留间隔 11 列，窄屏紧凑 7 列）
+            let (swatch_w, spaced_swatches) = if swatches.is_some() && max_w >= 44 {
+                (11usize, true)
+            } else if swatches.is_some() && max_w >= 26 {
+                (7usize, false)
+            } else {
+                (0usize, false)
+            };
+            let text_max_w = max_w.saturating_sub(swatch_w);
             let left = format!(" {mark}{}", item.label);
-            let detail_room = max_w.saturating_sub(left.width() + 3);
+            let detail_room = text_max_w.saturating_sub(left.width() + 3);
             let detail = if detail_room >= 6 && !item.detail.is_empty() {
                 format!("  {}", linebreak::clip(&item.detail, detail_room as u16))
             } else {
                 String::new()
             };
             let full = format!("{left}{detail}");
-            let clipped = linebreak::clip(&full, list_area.width);
+            let clipped = linebreak::clip(&full, text_max_w as u16);
+            let pad_to_swatch = text_max_w.saturating_sub(clipped.width());
             if is_sel {
-                let pad = max_w.saturating_sub(clipped.width());
-                lines.push(Line::styled(
-                    format!("{clipped}{}", " ".repeat(pad)),
-                    theme::picked_bar(),
-                ));
+                let bar = theme::picked_bar();
+                let mut spans = vec![Span::styled(
+                    format!("{clipped}{}", " ".repeat(pad_to_swatch)),
+                    bar,
+                )];
+                if let Some(colors) = swatches.filter(|_| swatch_w > 0) {
+                    let swatch_bg = bar.bg.unwrap_or(theme::palette().accent);
+                    spans.push(Span::styled(" ", Style::new().bg(swatch_bg)));
+                    for (idx_c, color) in colors.into_iter().enumerate() {
+                        if spaced_swatches && idx_c > 0 {
+                            spans.push(Span::styled(" ", Style::new().bg(swatch_bg)));
+                        }
+                        spans.push(Span::styled("■", Style::new().fg(color).bg(swatch_bg)));
+                    }
+                    spans.push(Span::styled(" ", Style::new().bg(swatch_bg)));
+                }
+                lines.push(Line::from(spans));
             } else {
-                lines.push(Line::from(vec![
+                let clipped_label = linebreak::clip(&item.label, text_max_w.saturating_sub(3) as u16);
+                let used_w = 1 + mark.width() + clipped_label.width() + detail.width();
+                let mut spans = vec![
                     Span::styled(" ", Style::new()),
                     Span::styled(
                         mark,
@@ -391,7 +357,7 @@ pub fn draw_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
                         },
                     ),
                     Span::styled(
-                        linebreak::clip(&item.label, list_area.width.saturating_sub(3)),
+                        clipped_label,
                         if item.active {
                             theme::accent_bold()
                         } else {
@@ -399,15 +365,33 @@ pub fn draw_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
                         },
                     ),
                     Span::styled(detail, theme::dim()),
-                ]));
+                ];
+                if let Some(colors) = swatches.filter(|_| swatch_w > 0) {
+                    let gap = text_max_w.saturating_sub(used_w) + 1;
+                    spans.push(Span::styled(" ".repeat(gap), Style::new()));
+                    for (idx_c, color) in colors.into_iter().enumerate() {
+                        if spaced_swatches && idx_c > 0 {
+                            spans.push(Span::styled(" ", Style::new()));
+                        }
+                        spans.push(Span::styled("■", Style::new().fg(color)));
+                    }
+                    spans.push(Span::styled(" ", Style::new()));
+                }
+                lines.push(Line::from(spans));
             }
         }
     }
     frame.render_widget(Paragraph::new(lines), list_area);
+    hits
 }
 
 /// 专属 `/resume` 会话恢复面板：双行结构化卡片、当前目录/全部范围 Tab 切换、最近时间右对齐、路径尾部保留。
-fn draw_resume_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
+fn draw_resume_picker(
+    frame: &mut Frame,
+    area: Rect,
+    picker: &PickerState,
+    hover: &HoverTarget,
+) -> PickerHits {
     let w = area.width.saturating_sub(4).clamp(46, 96);
     let filtered = picker.filtered();
     let card_rows = filtered.len().clamp(3, 8) as u16 * 2;
@@ -417,6 +401,10 @@ fn draw_resume_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
+    let mut hits = PickerHits {
+        popup,
+        ..PickerHits::default()
+    };
 
     let p = theme::palette();
     frame.render_widget(Clear, popup);
@@ -431,10 +419,21 @@ fn draw_resume_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
     } else {
         format!(" {}/{} ", sel + 1, filtered.len())
     };
-    let hint_line = Line::from(vec![Span::styled(
-        " ↑↓ 选择 · Tab 切换目录范围 · Enter 恢复 · Esc 关闭 ",
-        theme::faint(),
-    )]);
+    let bottom_y = popup.bottom().saturating_sub(1);
+    let (hint_line, footer_actions) = build_right_hint_line(
+        popup,
+        bottom_y,
+        &[
+            ("↑↓/点击 恢复 · ", None),
+            ("Tab 切换范围", Some(OverlayFooterAction::ToggleResumeScope)),
+            (" · ", None),
+            ("Enter 确认", Some(OverlayFooterAction::Confirm)),
+            (" · ", None),
+            ("Esc/点外部 关闭", Some(OverlayFooterAction::Close)),
+        ],
+        hover,
+    );
+    hits.footer_actions = footer_actions;
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -442,18 +441,34 @@ fn draw_resume_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
         .border_style(theme::accent())
         .title_top(title_line)
         .title_top(Line::styled(pos_label, theme::dim()).right_aligned())
-        .title_bottom(hint_line.right_aligned())
+        .title_bottom(hint_line)
         .style(Style::new().bg(p.panel_bg).fg(p.text));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
     if inner.height < 5 || inner.width < 20 {
-        return;
+        return hits;
     }
 
-    // 1. 顶部范围标签栏：当前目录 vs 全部会话
+    // 1. 顶部范围标签栏：当前目录 vs 全部会话（支持鼠标单击切换范围）
     let tab_cur = format!(" 当前目录 ({cur_dir_count}) ");
     let tab_all = format!(" 全部会话 ({total_count}) ");
+    let cur_w = u16::try_from(tab_cur.width()).unwrap_or(0);
+    let all_w = u16::try_from(tab_all.width()).unwrap_or(0);
+    let cur_x = inner.x.saturating_add(1);
+    let all_x = cur_x.saturating_add(cur_w).saturating_add(1);
+    if cur_x < inner.right() && cur_w > 0 {
+        hits.resume_tabs.push((
+            Rect::new(cur_x, inner.y, cur_w.min(inner.right().saturating_sub(cur_x)), 1),
+            ResumeScope::CurrentDir,
+        ));
+    }
+    if all_x < inner.right() && all_w > 0 {
+        hits.resume_tabs.push((
+            Rect::new(all_x, inner.y, all_w.min(inner.right().saturating_sub(all_x)), 1),
+            ResumeScope::All,
+        ));
+    }
     let (cur_style, all_style) = match picker.scope {
         ResumeScope::CurrentDir => (theme::picked_bar(), theme::dim()),
         ResumeScope::All => (theme::dim(), theme::picked_bar()),
@@ -516,7 +531,7 @@ fn draw_resume_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
     );
     let visible_cards = usize::from(list_area.height) / 2;
     if visible_cards == 0 {
-        return;
+        return hits;
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -534,7 +549,7 @@ fn draw_resume_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
             theme::dim(),
         ));
         frame.render_widget(Paragraph::new(lines), list_area);
-        return;
+        return hits;
     }
 
     let start = if sel >= visible_cards {
@@ -544,7 +559,17 @@ fn draw_resume_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
     };
     let max_w = usize::from(list_area.width);
 
-    for (i, (_, item)) in filtered.iter().enumerate().skip(start).take(visible_cards) {
+    for (card_offset, (i, (_, item))) in filtered
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_cards)
+        .enumerate()
+    {
+        hits.items.push((
+            Rect::new(list_area.x, list_area.y + (card_offset * 2) as u16, list_area.width, 2),
+            i,
+        ));
         let is_sel = i == sel;
         let row_bg = if is_sel {
             Some(p.row_focus_bg)
@@ -634,83 +659,5 @@ fn draw_resume_picker(frame: &mut Frame, area: Rect, picker: &PickerState) {
     }
 
     frame.render_widget(Paragraph::new(lines), list_area);
-}
-
-pub fn draw_permission_drawer(
-    frame: &mut Frame,
-    area: Rect,
-    req: &PermissionRequest,
-    selected: usize,
-) {
-    let p = theme::palette();
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme::warn())
-        .title_top(Line::styled(" ◈ 权限确认 ", theme::warn()))
-        .title_bottom(
-            Line::styled(" ↑↓ 选择 · 1-9/Enter 确认 · Esc 拒绝 ", theme::faint()).right_aligned(),
-        )
-        .style(Style::new().bg(p.panel_bg).fg(p.text));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("工具: ", theme::dim()),
-        Span::styled(
-            linebreak::clip(&req.title, inner.width.saturating_sub(6)),
-            theme::accent_bold(),
-        ),
-    ]));
-
-    if let Some(raw) = &req.raw_input {
-        if let Some(cmd) = raw["CommandLine"]
-            .as_str()
-            .or_else(|| raw["command"].as_str())
-        {
-            let one_line = cmd.replace('\n', " ");
-            let clipped = linebreak::clip(&one_line, inner.width.saturating_sub(2));
-            let mut spans = vec![Span::styled("$ ", theme::picked())];
-            for piece in crate::markdown::code::highlight_shell_line(&clipped, None) {
-                spans.push(Span::styled(piece.text, piece.style));
-            }
-            lines.push(Line::from(spans));
-        } else {
-            let preview = raw["Path"]
-                .as_str()
-                .or_else(|| raw["path"].as_str())
-                .map(String::from)
-                .unwrap_or_else(|| raw.to_string());
-            lines.push(Line::styled(
-                linebreak::clip(&preview.replace('\n', " "), inner.width),
-                theme::md_code(),
-            ));
-        }
-    }
-    lines.push(Line::default());
-
-    let max_w = usize::from(inner.width);
-    for (idx, opt) in req.options.iter().enumerate() {
-        let is_sel = idx == selected;
-        let label = format!(" [{}] {}", idx + 1, opt.name);
-        if is_sel {
-            let pad = max_w.saturating_sub(label.width());
-            lines.push(Line::styled(
-                format!("{label}{}", " ".repeat(pad)),
-                theme::picked_bar(),
-            ));
-        } else {
-            let style = if opt.kind.contains("reject") {
-                theme::error()
-            } else if opt.kind.contains("allow") {
-                theme::good()
-            } else {
-                theme::text()
-            };
-            lines.push(Line::styled(label, style));
-        }
-    }
-    frame.render_widget(Paragraph::new(lines), inner);
+    hits
 }

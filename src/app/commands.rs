@@ -2,7 +2,7 @@
 
 use crate::acp::AcpCommand;
 use crate::clipboard;
-use crate::theme::{self, ThemePreset};
+use crate::theme;
 
 use crate::ui::overlay::PickerKind;
 
@@ -132,14 +132,7 @@ impl App {
                 true
             }
             "theme" => {
-                if !arg.is_empty()
-                    && let Some(preset) = ThemePreset::parse(arg) {
-                        theme::set_preset(preset);
-                        self.save_prefs();
-                        self.toast(format!("已切换主题：{}", preset.label()), false);
-                        return true;
-                    }
-                self.open_theme_picker();
+                self.handle_theme_command(arg);
                 true
             }
             "bg" => {
@@ -166,6 +159,10 @@ impl App {
                     },
                     false,
                 );
+                true
+            }
+            "todo" => {
+                self.toggle_todo_bar();
                 true
             }
             "copy" => {
@@ -208,6 +205,65 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// 处理 `/theme` 及其子命令（直接切换、热重载、导出自定义模板、查看配置目录或打开选择器）。
+    ///
+    /// 参数:
+    /// - `arg`: `/theme` 后附带的参数字符串
+    fn handle_theme_command(&mut self, arg: &str) {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() {
+            self.open_theme_picker();
+            return;
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("").trim();
+
+        // 1. `/theme reload`：重新扫描用户 themes 目录并实时刷新当前自定义配色
+        if sub.eq_ignore_ascii_case("reload") {
+            let count = theme::reload_custom_themes();
+            self.toast(format!("已重载自定义主题（共 {count} 套）"), false);
+            return;
+        }
+        // 2. `/theme export [name]` 或 `/theme init [name]`：将当前主题导出为 JSON 模板
+        if sub.eq_ignore_ascii_case("export") || sub.eq_ignore_ascii_case("init") {
+            match theme::export_current_theme(rest) {
+                Ok(path) => {
+                    let display = path.display().to_string();
+                    clipboard::copy_text(&display);
+                    self.toast(format!("已导出主题模板（路径已复制）：{display}"), false);
+                }
+                Err(err) => self.toast(err, true),
+            }
+            return;
+        }
+        // 3. `/theme dir` 或 `/theme path`：展示并复制自定义主题目录路径
+        if sub.eq_ignore_ascii_case("dir") || sub.eq_ignore_ascii_case("path") {
+            if let Some(dir) = crate::paths::themes_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                let display = dir.display().to_string();
+                clipboard::copy_text(&display);
+                self.toast(format!("自定义主题目录（已复制）：{display}"), false);
+            } else {
+                self.toast("无法解析自定义主题目录", true);
+            }
+            return;
+        }
+
+        // 4. 按内置 ID/别名或自定义 ID 直接切换（先热重载一次以识别新放入的文件）
+        let _ = theme::reload_custom_themes();
+        if let Some(label) = theme::set_by_id(trimmed) {
+            self.save_prefs();
+            self.toast(format!("已切换主题：{label}"), false);
+        } else {
+            self.toast(
+                format!("未找到主题「{trimmed}」，已打开选择器"),
+                true,
+            );
+            self.open_theme_picker();
         }
     }
 
@@ -267,6 +323,8 @@ impl App {
         self.transcript.clear();
         self.subagents.clear();
         self.background.clear();
+        self.todo_call_ids.clear();
+        self.todo_bar_expanded = true;
         self.completion_cache.invalidate();
         self.completion_dismissed_text = None;
         self.pending_images.clear();
@@ -303,6 +361,8 @@ impl App {
         self.transcript.clear();
         self.subagents.clear();
         self.background.clear();
+        self.todo_call_ids.clear();
+        self.todo_bar_expanded = true;
         self.completion_cache.invalidate();
         self.completion_dismissed_text = None;
         self.permission = None;
@@ -323,6 +383,22 @@ impl App {
                 cwd: target_cwd,
             });
         }
+    }
+
+    /// 切换底部任务清单停靠条的展开/收起状态（无任务清单时弹出轻量提示）。
+    pub(super) fn toggle_todo_bar(&mut self) {
+        if self.transcript.latest_plan.is_empty() {
+            self.toast("当前会话暂无任务清单", false);
+            return;
+        }
+        self.todo_bar_expanded = !self.todo_bar_expanded;
+        let counts = crate::todo::count_items(&self.transcript.latest_plan);
+        let msg = if self.todo_bar_expanded {
+            format!("已展开任务清单 ({}/{})", counts.finished(), counts.total)
+        } else {
+            "已收起底部任务清单为单行".to_string()
+        };
+        self.toast(msg, false);
     }
 
     pub(super) fn cancel_turn(&mut self) {

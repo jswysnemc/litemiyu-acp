@@ -2,16 +2,24 @@
 
 pub mod activity;
 mod elicitation;
+mod footer;
 pub mod format;
+pub mod home;
 mod input_box;
+#[cfg(test)]
+mod fold_tests;
 #[cfg(test)]
 mod interaction_tests;
 pub mod overlay;
+mod overlay_drawers;
+pub mod overlay_hits;
 pub mod rows;
 pub mod selection;
 pub mod sidebar;
+mod sticky_prompt;
 #[cfg(test)]
 mod tests;
+mod todo_bar;
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -19,18 +27,18 @@ use std::time::Instant;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
-use unicode_width::UnicodeWidthStr;
 
 use crate::acp::{PermissionRequest, SessionSummary};
 use crate::app::{ElicitationState, QueuedMode};
 use crate::background::BackgroundTask;
 use crate::completion::CompletionMenu;
 use crate::input::InputEditor;
-use crate::linebreak;
 use crate::theme;
-use crate::transcript::{FoldSection, Transcript, format_short};
+use crate::transcript::{FoldSection, Transcript};
+
+pub use home::{HomeAction, HomeHits};
+pub use overlay_hits::{OverlayFooterAction, OverlayHits};
 
 /// 对话界面（非开始界面）输入框最大可见行数（内容增加时自动增高，超过后内部滚动）。
 pub const CHAT_INPUT_MAX_ROWS: u16 = 8;
@@ -43,11 +51,12 @@ pub fn input_text_width(box_w: u16) -> u16 {
 }
 
 use overlay::PickerState;
-use rows::{MdCache, RenderRow, RowCopyMeta, build_body, row_to_line};
+use rows::{InlineAction, InlineButton, MdCache, RenderRow, RowCopyMeta, build_body, row_to_line};
 use input_box::{InputBoxStatus, draw_input_box, draw_pulse_line, draw_scrollbar};
 use selection::{ScreenSnapshot, apply_selection_highlight};
 pub use selection::TextSelection;
 use sidebar::{SidebarData, SidebarHits};
+use sticky_prompt::StickyPromptHit;
 
 /// 正文单行命中热区元信息（屏幕行、条目 ID、是否可折叠、行内链接列表）。
 pub type BodyRowHit = (u16, u64, bool, Vec<(u16, u16, String)>);
@@ -59,10 +68,22 @@ pub enum HoverTarget {
     None,
     SidebarBackground(u64),
     SidebarSubagent(u64),
-    Fold(u64, FoldSection),
+    SidebarTodo,
+    InlineButton {
+        row: u16,
+        col_start: u16,
+        col_end: u16,
+        entry_id: u64,
+        action: InlineAction,
+    },
     SidebarJump(u64),
     SidebarSession(String),
     SidebarContext,
+    TodoBarToggle,
+    StickyUserPrompt(u64),
+    HomeAction(usize, HomeAction),
+    HomeSession(String),
+    OverlayAction(OverlayFooterAction),
     BottomButton,
     UsageCell,
     BodyLink {
@@ -88,6 +109,14 @@ pub struct FrameHits {
     pub sidebar_divider_col: Option<u16>,
     /// 「↓ 回到底部」按钮点击热区
     pub bottom_button: Rect,
+    /// 底部停靠任务条点击展开/收起热区
+    pub todo_bar_toggle: Rect,
+    /// 主视图顶部黏性上条用户消息点击跳转热区
+    pub sticky_prompt: StickyPromptHit,
+    /// 启动首页交互热区（模型/快捷操作/最近会话）
+    pub home: HomeHits,
+    /// 活跃浮层、权限/提问抽屉与补全菜单的鼠标命中热区
+    pub overlay: OverlayHits,
     /// 底栏右侧上下文/用量点击热区
     pub usage_cell: Rect,
     /// 当前输入框外框区域（用于布局测量与交互定位）
@@ -99,6 +128,7 @@ pub struct FrameHits {
     pub sidebar: SidebarHits,
     pub body_rows: Vec<BodyRowHit>,
     pub fold_rows: HashMap<u16, (u64, FoldSection)>,
+    pub inline_buttons: HashMap<u16, (u64, Vec<InlineButton>)>,
     pub total_body_rows: usize,
     pub visible_body_rows: usize,
     pub entry_starts: HashMap<u64, usize>,
@@ -126,6 +156,7 @@ pub struct ViewState<'a> {
     pub transcript: &'a Transcript,
     pub editor: &'a InputEditor,
     pub cwd: &'a str,
+    pub git_branch: Option<&'a str>,
     pub agent_banner: &'a str,
     pub model_label: &'a str,
     pub effort_label: &'a str,
@@ -136,6 +167,7 @@ pub struct ViewState<'a> {
     pub scroll: usize,
     pub auto_follow: bool,
     pub show_sidebar: bool,
+    pub todo_bar_expanded: bool,
     pub tick: usize,
     pub started_at: Instant,
     pub toast: Option<(&'a str, bool)>,
@@ -169,7 +201,7 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
 
     let is_home = view.transcript.entries.is_empty() && !view.busy;
     if is_home {
-        return draw_home(frame, full, view);
+        return home::draw(frame, full, view);
     }
 
     // 宽屏双栏拆分（>= 115 列且侧边栏开启）
@@ -229,19 +261,70 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
     };
 
     let body_top = main_area.y + 1;
-    // 正文底部与状态行之间留 1 行呼吸空白，状态行紧贴输入框/抽屉上方
-    let body_bottom = pulse_y.saturating_sub(1).max(body_top);
+    let todo_bar_h = todo_bar::measure_height(
+        &view.transcript.latest_plan,
+        view.todo_bar_expanded,
+        main_area.height,
+    );
+    let todo_area = if todo_bar_h > 0 && pulse_y >= body_top.saturating_add(todo_bar_h + 1) {
+        Rect::new(
+            content_x + 1,
+            pulse_y.saturating_sub(todo_bar_h),
+            content_w.saturating_sub(2),
+            todo_bar_h,
+        )
+    } else {
+        Rect::default()
+    };
+    // 正文底部与停靠任务栏/状态行之间留 1 行呼吸空白，状态行紧贴输入框/抽屉上方
+    let chrome_top = if todo_area.height > 0 {
+        todo_area.y
+    } else {
+        pulse_y
+    };
+    let body_bottom = chrome_top.saturating_sub(1).max(body_top);
+    let text_room = content_w.saturating_sub(2).max(16);
+
+    // 1. 构建正文时间线，并根据当前滚动位置决定是否在主视图顶部黏住上条用户消息
+    let built = build_body(
+        view.transcript,
+        view.subagents,
+        text_room,
+        view.busy,
+        view.tick,
+        cache,
+    );
+    let total_rows = built.rows.len();
+    let base_visible = usize::from(body_bottom.saturating_sub(body_top));
+    let sticky_body_top = main_area.y.saturating_add(3);
+    let sticky_visible = usize::from(body_bottom.saturating_sub(sticky_body_top));
+    let sticky_max_scroll = total_rows.saturating_sub(sticky_visible);
+    // 仅当内容超过一屏可滚动且高度足够时启用顶部黏性条，并用实际滚动偏移判定避免底部临界闪烁
+    let sticky_data = if body_bottom >= main_area.y.saturating_add(6) && total_rows > base_visible {
+        let probe_scroll = if view.auto_follow {
+            sticky_max_scroll
+        } else {
+            view.scroll.min(sticky_max_scroll)
+        };
+        sticky_prompt::resolve(view.transcript, &built.entry_starts, probe_scroll)
+    } else {
+        None
+    };
+
+    let (actual_body_top, sticky_hit) = if let Some((eid, raw_text)) = sticky_data {
+        // 顶部保留 1 行呼吸上边距（与右侧边栏顶沿齐平），黏性条下方再留 1 行空白分隔正文
+        let sticky_area = Rect::new(content_x, main_area.y.saturating_add(1), text_room, 1);
+        let hit = sticky_prompt::draw(frame, sticky_area, eid, raw_text, view.hover);
+        (sticky_body_top, hit)
+    } else {
+        (body_top, StickyPromptHit::default())
+    };
     let body_area = Rect::new(
         content_x,
-        body_top,
+        actual_body_top,
         content_w,
-        body_bottom.saturating_sub(body_top),
+        body_bottom.saturating_sub(actual_body_top),
     );
-
-    // 1. 构建并渲染正文时间线
-    let text_room = body_area.width.saturating_sub(2).max(16);
-    let built = build_body(view.transcript, view.subagents, text_room, view.tick, cache);
-    let total_rows = built.rows.len();
     let visible_rows = usize::from(body_area.height);
     let max_scroll = total_rows.saturating_sub(visible_rows);
     let scroll = if view.auto_follow {
@@ -252,6 +335,7 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
 
     let mut body_hits = Vec::new();
     let mut fold_rows = HashMap::new();
+    let mut inline_buttons = HashMap::new();
     let mut row_copy_meta = HashMap::new();
     let mut render_lines = Vec::with_capacity(visible_rows);
     for (offset, row) in built
@@ -271,10 +355,9 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         row_copy_meta.insert(screen_y, row.copy_meta);
         if let rows::RowAction::Fold(section) = row.action {
             fold_rows.insert(screen_y, (row.entry_id, section));
-            if *view.hover == HoverTarget::Fold(row.entry_id, section) {
-                render_lines.push(Line::styled("点击展开10行，右击全部展开", theme::accent_bold().bg(p.row_focus_bg)));
-                continue;
-            }
+        }
+        if !row.buttons.is_empty() {
+            inline_buttons.insert(screen_y, (row.entry_id, row.buttons.clone()));
         }
         render_lines.push(row_to_line(row));
     }
@@ -308,6 +391,21 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
     // 计算当前视口对应的用户消息（供侧边栏 `❱` 指示）
     let current_user_entry = find_current_user_entry(view.transcript, &built.rows, scroll, view.auto_follow);
 
+    // 1.5 底部停靠任务清单条（窄屏/隐藏侧栏/手动展开时展示，点击或按 Ctrl+T 切换展开）
+    let todo_bar_toggle = if todo_area.height > 0 {
+        todo_bar::draw(
+            frame,
+            todo_area,
+            &view.transcript.latest_plan,
+            view.todo_bar_expanded,
+            view.busy,
+            view.tick,
+            view.hover,
+        )
+    } else {
+        Rect::default()
+    };
+
     // 2. 流光运行状态行 / Toast / 可点击的「回到底部」按钮（与输入框内沿、底栏左右对齐）
     let mut bottom_button = Rect::default();
     if pulse_y >= body_top && pulse_y < box_area.y {
@@ -326,11 +424,14 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
     }
 
     // 3. 权限审批抽屉 / 代理提问抽屉 / 圆角输入框
+    let mut overlay_hits = OverlayHits::default();
     let input_text_area = if let Some((req, sel)) = view.permission {
-        overlay::draw_permission_drawer(frame, box_area, req, sel);
+        overlay_hits.permission =
+            overlay::draw_permission_drawer(frame, box_area, req, sel, view.hover);
         Rect::default()
     } else if let Some(el) = view.elicitation {
-        elicitation::draw_elicitation_drawer(frame, box_area, el);
+        overlay_hits.elicitation =
+            elicitation::draw_elicitation_drawer(frame, box_area, el, view.hover);
         Rect::default()
     } else {
         draw_input_box(
@@ -349,8 +450,8 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         )
     };
 
-    // 4. 极简底栏（右下角展示用量与当前工作目录）
-    let usage_cell = draw_footer(
+    // 4. 极简底栏（右下角分层着色展示用量、工作目录与 Git 分支）
+    let usage_cell = footer::draw(
         frame,
         Rect::new(content_x + 1, footer_y, content_w.saturating_sub(2), 1),
         view,
@@ -367,6 +468,8 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
                 cwd: view.cwd,
                 mode_label: view.mode_label,
                 tier: view.tier,
+                busy: view.busy,
+                tick: view.tick,
                 current_user_entry,
                 background_tasks: view.background_tasks,
                 subagents: view.subagents,
@@ -385,10 +488,16 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         && view.picker.is_none()
         && let Some(menu) = view.completion_menu
     {
-        overlay::draw_completion_menu(frame, box_area, menu, view.completion_selected);
+        overlay_hits.completion = overlay::draw_completion_menu(
+            frame,
+            box_area,
+            menu,
+            view.completion_selected,
+            view.hover,
+        );
     }
     if let Some(picker) = view.picker {
-        overlay::draw_picker(frame, full, picker);
+        overlay_hits.picker = overlay::draw_picker(frame, full, picker, view.hover);
     }
 
     // 抓取扁平屏幕纯文本快照（整屏单块连续内存），再叠加选区反色高亮
@@ -399,6 +508,26 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         body_area.height,
     );
     let screen_snapshot = ScreenSnapshot::capture(frame.buffer_mut(), full);
+    // 折叠展开/完整文件/收起按钮：悬停仅高亮前景文字，绝不铺设背景色
+    if let HoverTarget::InlineButton {
+        row,
+        col_start,
+        col_end,
+        ..
+    } = *view.hover
+        && view.selection.is_none()
+        && view.picker.is_none()
+        && view.permission.is_none()
+        && view.elicitation.is_none()
+        && row < full.bottom()
+    {
+        let buf = frame.buffer_mut();
+        let hi_fg = theme::accent_bold().fg.unwrap_or(p.accent);
+        for x in col_start..col_end.min(full.right()) {
+            let cell = &mut buf[(x, row)];
+            cell.set_style(cell.style().fg(hi_fg).add_modifier(Modifier::BOLD));
+        }
+    }
     // 仅对紧凑行内链接叠加悬停下划线与微底色（不作用于正文大块或折叠行）
     if let HoverTarget::BodyLink {
         row,
@@ -434,6 +563,10 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         scrollbar_col,
         sidebar_divider_col: (side_w > 0).then_some(side_area.x),
         bottom_button,
+        todo_bar_toggle,
+        sticky_prompt: sticky_hit,
+        home: HomeHits::default(),
+        overlay: overlay_hits,
         usage_cell,
         input_area: box_area,
         input_text_area,
@@ -441,260 +574,13 @@ pub fn draw(frame: &mut Frame, view: &ViewState<'_>, cache: &mut MdCache) -> Fra
         sidebar: sidebar_hits,
         body_rows: body_hits,
         fold_rows,
+        inline_buttons,
         total_body_rows: total_rows,
         visible_body_rows: visible_rows,
         entry_starts: built.entry_starts,
         row_copy_meta,
         screen_snapshot,
     }
-}
-
-/// 极简居中启动首页（复刻 LiteMiyu `tui-new.webp`）。
-fn draw_home(frame: &mut Frame, full: Rect, view: &ViewState<'_>) -> FrameHits {
-    let box_w = full.width.saturating_sub(6).clamp(28, 80);
-    let text_w = input_text_width(box_w);
-    let max_inner = full
-        .height
-        .saturating_sub(10)
-        .clamp(1, HOME_INPUT_MAX_ROWS);
-    let inner_rows = (view.editor.visual_lines(text_w).len() as u16).clamp(1, max_inner);
-    let box_h = inner_rows + 2;
-
-    let box_x = full.x + (full.width.saturating_sub(box_w)) / 2;
-    let box_y = full.y + (full.height.saturating_sub(box_h + 6)) / 2;
-    let box_area = Rect::new(box_x, box_y, box_w, box_h);
-
-    // 输入框上方轻量标题/连接状态
-    if box_y >= full.y + 2 {
-        let banner_area = Rect::new(box_x + 1, box_y - 2, box_w.saturating_sub(2), 1);
-        if view.connecting {
-            let anim_frame = activity::frame_at(view.started_at.elapsed());
-            frame.render_widget(
-                Paragraph::new(activity::render_status_line(
-                    "正在连接 ACP 服务…",
-                    "",
-                    anim_frame,
-                )),
-                banner_area,
-            );
-        } else {
-            let left = Span::styled("litemiyu-acp", theme::accent_bold());
-            let sep = Span::styled(" · ", theme::faint());
-            let right = Span::styled(view.agent_banner, theme::dim());
-            frame.render_widget(Paragraph::new(Line::from(vec![left, sep, right])), banner_area);
-        }
-    }
-
-    let input_text_area = if let Some((req, sel)) = view.permission {
-        let dh = (req.options.len() as u16 + 5).clamp(7, 14);
-        overlay::draw_permission_drawer(frame, Rect::new(box_x, box_y, box_w, dh), req, sel);
-        Rect::default()
-    } else if let Some(el) = view.elicitation {
-        let dh = elicitation::drawer_height(el, full.height);
-        elicitation::draw_elicitation_drawer(frame, Rect::new(box_x, box_y, box_w, dh), el);
-        Rect::default()
-    } else {
-        draw_input_box(
-            frame,
-            box_area,
-            view.editor,
-            view.picker.is_none(),
-            true,
-            InputBoxStatus {
-                pending_images: view.pending_images,
-                queued_mode: view.queued_mode,
-                queued_count: view.queued_count,
-                queued_head_preview: view.queued_head_preview,
-                busy: view.busy,
-            },
-        )
-    };
-
-    // 框下模型与工作区
-    let info_y = box_area.bottom();
-    let mut usage_cell = Rect::default();
-    if info_y < full.bottom() {
-        usage_cell = draw_footer(
-            frame,
-            Rect::new(box_x + 1, info_y, box_w.saturating_sub(2), 1),
-            view,
-            false,
-        );
-    }
-    if info_y + 2 < full.bottom() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                linebreak::clip(view.cwd, box_w.saturating_sub(2)),
-                theme::faint(),
-            )),
-            Rect::new(box_x + 1, info_y + 2, box_w.saturating_sub(2), 1),
-        );
-    }
-    if info_y + 4 < full.bottom() {
-        let hint = if let Some((msg, is_err)) = view.toast {
-            Line::styled(msg, if is_err { theme::error() } else { theme::good() })
-        } else {
-            Line::styled(
-                "/resume 恢复会话 · /model 切模型 · /theme 切主题 · Shift+Tab 切模式 · /help 帮助",
-                theme::faint(),
-            )
-        };
-        frame.render_widget(
-            Paragraph::new(hint),
-            Rect::new(box_x + 1, info_y + 4, box_w.saturating_sub(2), 1),
-        );
-    }
-
-    if view.permission.is_none()
-        && view.elicitation.is_none()
-        && view.picker.is_none()
-        && let Some(menu) = view.completion_menu
-    {
-        overlay::draw_completion_menu(frame, box_area, menu, view.completion_selected);
-    }
-    if let Some(picker) = view.picker {
-        overlay::draw_picker(frame, full, picker);
-    }
-
-    let screen_snapshot = ScreenSnapshot::capture(frame.buffer_mut(), full);
-    let empty_meta = HashMap::new();
-    if let Some(sel) = view.selection {
-        apply_selection_highlight(frame.buffer_mut(), full, sel, Rect::default(), &empty_meta);
-    }
-
-    FrameHits {
-        main_area: full,
-        usage_cell,
-        input_area: box_area,
-        input_text_area,
-        input_text_width: text_w,
-        screen_snapshot,
-        ..FrameHits::default()
-    }
-}
-
-fn draw_footer(frame: &mut Frame, area: Rect, view: &ViewState<'_>, show_cwd: bool) -> Rect {
-    let mut left_spans = vec![Span::styled(view.model_label.to_string(), theme::model())];
-    if !view.effort_label.is_empty() {
-        left_spans.push(Span::styled(" · ", theme::faint()));
-        left_spans.push(Span::styled(view.effort_label.to_string(), theme::accent()));
-    }
-    if !view.mode_label.is_empty() {
-        left_spans.push(Span::styled(" · ", theme::faint()));
-        left_spans.push(Span::styled(view.mode_label.to_string(), theme::dim()));
-    }
-    if view.queued_mode == QueuedMode::SendImmediately {
-        left_spans.push(Span::styled(" · ", theme::faint()));
-        left_spans.push(Span::styled(view.queued_mode.short_label(), theme::accent()));
-    }
-    if view.queued_count > 0 {
-        left_spans.push(Span::styled(" · ", theme::faint()));
-        left_spans.push(Span::styled(
-            format!("队列 {}", view.queued_count),
-            theme::accent(),
-        ));
-    }
-    if !view.background_tasks.is_empty() {
-        left_spans.push(Span::styled(" · ", theme::faint()));
-        left_spans.push(Span::styled(
-            format!("后台 {}", view.background_tasks.len()),
-            theme::accent(),
-        ));
-    }
-    let left_w: usize = left_spans.iter().map(|s| s.content.width()).sum();
-    frame.render_widget(Paragraph::new(Line::from(left_spans)), area);
-
-    // 右侧：上下文与累计用量（可点击弹出状态/压缩面板）+ 当前工作目录
-    let mut usage_parts = Vec::new();
-    if view.transcript.context_window > 0 && view.transcript.context_used > 0 {
-        let pct = (view.transcript.context_used as f64 / view.transcript.context_window as f64) * 100.0;
-        usage_parts.push(format!(
-            "{}/{}({:.1}%)",
-            format_short(view.transcript.context_used),
-            format_short(view.transcript.context_window),
-            pct
-        ));
-    }
-    let total = view.transcript.total_input
-        + view.transcript.total_output
-        + view.transcript.total_cached_read;
-    if total > 0 {
-        let mut sum = format!("Σ{}", format_short(total));
-        let denom = view.transcript.total_input + view.transcript.total_cached_read;
-        if denom > 0 && view.transcript.total_cached_read > 0 {
-            let pct = (view.transcript.total_cached_read * 100) / denom;
-            sum.push_str(&format!("(C{pct}%)"));
-        }
-        usage_parts.push(sum);
-    }
-    let usage_text = usage_parts.join(" · ");
-    let usage_w = usage_text.width();
-    let avail = usize::from(area.width).saturating_sub(left_w + 2);
-    if avail == 0 {
-        return Rect::default();
-    }
-
-    let mut right_spans: Vec<Span<'static>> = Vec::new();
-    let mut show_usage = false;
-    let mut cwd_w_used = 0usize;
-
-    let cwd_budget = if show_cwd && !view.cwd.trim().is_empty() {
-        if usage_w > 0 && avail >= usage_w + 11 {
-            (avail - usage_w - 3).min(36)
-        } else if usage_w == 0 && avail >= 6 {
-            avail.min(44)
-        } else if avail >= 10 && usage_w > avail {
-            avail.min(36)
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-
-    if usage_w > 0 && usage_w <= avail {
-        let usage_style = if matches!(view.hover, HoverTarget::UsageCell) {
-            theme::accent()
-                .bg(theme::palette().row_focus_bg)
-                .add_modifier(Modifier::UNDERLINED)
-        } else {
-            theme::dim()
-        };
-        right_spans.push(Span::styled(usage_text.clone(), usage_style));
-        show_usage = true;
-    }
-
-    if cwd_budget >= 6 {
-        let short_cwd = overlay::shorten_path_left(view.cwd, cwd_budget as u16);
-        if !short_cwd.is_empty() {
-            if show_usage {
-                right_spans.push(Span::styled(" · ", theme::faint()));
-                cwd_w_used = 3 + short_cwd.width();
-            } else {
-                cwd_w_used = short_cwd.width();
-            }
-            right_spans.push(Span::styled(short_cwd, theme::faint()));
-        }
-    }
-
-    if !right_spans.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(right_spans).right_aligned()),
-            area,
-        );
-    }
-
-    if show_usage {
-        let w = u16::try_from(usage_w).unwrap_or(0).min(area.width);
-        let right_offset = u16::try_from(cwd_w_used).unwrap_or(0);
-        let x = area
-            .right()
-            .saturating_sub(right_offset)
-            .saturating_sub(w)
-            .max(area.x);
-        return Rect::new(x, area.y, w, 1);
-    }
-    Rect::default()
 }
 
 fn find_current_user_entry(

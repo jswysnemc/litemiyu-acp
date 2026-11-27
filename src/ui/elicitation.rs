@@ -12,6 +12,9 @@ use crate::app::ElicitationState;
 use crate::linebreak;
 use crate::theme;
 
+use super::HoverTarget;
+use super::overlay_hits::{ElicitationHits, OverlayFooterAction, build_right_hint_line};
+
 /// 计算提问抽屉在当前主栏高度下应占用的合理行数。
 ///
 /// 参数:
@@ -48,13 +51,25 @@ pub fn drawer_height(state: &ElicitationState, max_h: u16) -> u16 {
         .min(max_h.saturating_sub(3).max(5))
 }
 
-/// 在输入框区域绘制 `elicitation/create` 交互式提问/表单抽屉。
+/// 在输入框区域绘制 `elicitation/create` 交互式提问/表单抽屉，并返回各页签与选项的鼠标热区。
 ///
 /// 参数:
 /// - `frame`: ratatui 渲染帧
 /// - `area`: 抽屉外框区域
 /// - `state`: 当前提问表单状态
-pub fn draw_elicitation_drawer(frame: &mut Frame, area: Rect, state: &ElicitationState) {
+///
+/// 返回:
+/// - 抽屉外框、多题页签、选项行及链接的鼠标热区
+pub fn draw_elicitation_drawer(
+    frame: &mut Frame,
+    area: Rect,
+    state: &ElicitationState,
+    hover: &HoverTarget,
+) -> ElicitationHits {
+    let mut hits = ElicitationHits {
+        area,
+        ..ElicitationHits::default()
+    };
     let p = theme::palette();
     frame.render_widget(Clear, area);
 
@@ -65,43 +80,59 @@ pub fn draw_elicitation_drawer(frame: &mut Frame, area: Rect, state: &Elicitatio
         " ◈ 代理提问 ".to_string()
     };
 
-    let hint = if state.req.mode == "url" || field_count == 0 {
-        " Enter 确认 · O 打开链接 · Esc 取消 "
+    let bottom_y = area.bottom().saturating_sub(1);
+    let (hint_line, footer_actions) = if state.req.mode == "url" || field_count == 0 {
+        let mut segs: Vec<(&str, Option<OverlayFooterAction>)> =
+            vec![("Enter 确认", Some(OverlayFooterAction::Confirm))];
+        if state.req.url.is_some() {
+            segs.push((" · ", None));
+            segs.push(("O 打开链接", Some(OverlayFooterAction::OpenUrl)));
+        }
+        segs.push((" · ", None));
+        segs.push(("Esc 取消", Some(OverlayFooterAction::Close)));
+        build_right_hint_line(area, bottom_y, &segs, hover)
     } else {
         let active = state.active_field.min(field_count - 1);
         let field = &state.req.fields[active];
         let is_editing = state.answers[active].editing_text;
-        match (&field.kind, is_editing, field_count > 1) {
+        let prefix = match (&field.kind, is_editing, field_count > 1) {
             (ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Number { .. }, _, true) => {
-                " 输入回答 · Tab 切题 · Enter 下一题/提交 · Esc 取消 "
+                "输入回答 · Tab 切题 · "
             }
             (ElicitationFieldKind::Text { .. } | ElicitationFieldKind::Number { .. }, _, false) => {
-                " 输入回答 · Enter 提交 · Esc 取消 "
+                "输入回答 · "
             }
-            (_, true, _) => " 输入自定义内容 · ↑↓ 返回选项 · Enter 确认 · Esc 退出输入 ",
-            (ElicitationFieldKind::MultiSelect { .. }, false, true) => {
-                " ↑↓ 移动 · Space 勾选 · ←→ 切题 · Enter 提交 · Esc 取消 "
-            }
-            (ElicitationFieldKind::MultiSelect { .. }, false, false) => {
-                " ↑↓ 移动 · Space 勾选 · 1-9 快选 · Enter 提交 · Esc 取消 "
-            }
-            (_, false, true) => " ↑↓ 选择 · ←→ 切题 · 1-9/Enter 确认 · Esc 取消 ",
-            (_, false, false) => " ↑↓ 选择 · 1-9/Enter 确认 · Esc 取消 ",
-        }
+            (_, true, _) => "输入自定义内容 · ",
+            (ElicitationFieldKind::MultiSelect { .. }, false, _) => "点击/Space 勾选 · ",
+            (_, false, true) => "点击/↑↓ 选择 · ←→ 切题 · ",
+            (_, false, false) => "点击/↑↓ 选择 · ",
+        };
+        build_right_hint_line(
+            area,
+            bottom_y,
+            &[
+                (prefix, None),
+                ("Enter 提交", Some(OverlayFooterAction::Confirm)),
+                (" · ", None),
+                ("Esc 取消", Some(OverlayFooterAction::Close)),
+            ],
+            hover,
+        )
     };
+    hits.footer_actions = footer_actions;
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme::accent())
         .title_top(Line::styled(title, theme::accent_bold()))
-        .title_bottom(Line::styled(hint, theme::faint()).right_aligned())
+        .title_bottom(hint_line)
         .style(Style::new().bg(p.panel_bg).fg(p.text));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     if inner.width < 6 || inner.height == 0 {
-        return;
+        return hits;
     }
 
     if state.req.mode == "url" || field_count == 0 {
@@ -111,13 +142,17 @@ pub fn draw_elicitation_drawer(frame: &mut Frame, area: Rect, state: &Elicitatio
         )];
         if let Some(url) = &state.req.url {
             lines.push(Line::default());
+            let url_y = inner.y.saturating_add(lines.len() as u16);
+            if url_y < inner.bottom() {
+                hits.url_row = Some(Rect::new(inner.x, url_y, inner.width, 1));
+            }
             lines.push(Line::styled(
                 linebreak::clip(url, inner.width),
                 theme::md_url(),
             ));
         }
         frame.render_widget(Paragraph::new(lines), inner);
-        return;
+        return hits;
     }
 
     let active = state.active_field.min(field_count - 1);
@@ -126,14 +161,23 @@ pub fn draw_elicitation_drawer(frame: &mut Frame, area: Rect, state: &Elicitatio
     let max_w = usize::from(inner.width);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut cursor_pos: Option<(u16, u16)> = None;
+    let mut raw_tabs: Vec<(u16, u16, usize)> = Vec::new();
+    let mut raw_options: Vec<(usize, usize, bool)> = Vec::new();
 
-    // 1. 多题导航页签
+    // 1. 多题导航页签（记录每个页签横向坐标，供鼠标单击切题）
     if field_count > 1 {
         let mut tab_spans: Vec<Span<'static>> = Vec::new();
+        let mut tab_x = inner.x;
         for i in 0..field_count {
             let done = state.is_field_answered(i);
             let mark = if done { "✓" } else { "·" };
             let label = format!(" {mark} 问题{} ", i + 1);
+            let label_w = u16::try_from(label.width()).unwrap_or(0);
+            if tab_x < inner.right() && label_w > 0 {
+                let w = label_w.min(inner.right().saturating_sub(tab_x));
+                raw_tabs.push((tab_x, w, i));
+            }
+            tab_x = tab_x.saturating_add(label_w).saturating_add(1);
             let style = if i == active {
                 theme::picked_bar()
             } else if done {
@@ -167,6 +211,7 @@ pub fn draw_elicitation_drawer(frame: &mut Frame, area: Rect, state: &Elicitatio
     match &field.kind {
         ElicitationFieldKind::SingleSelect(opts) => {
             for (idx, opt) in opts.iter().enumerate() {
+                raw_options.push((lines.len(), idx, false));
                 let is_cur = !ans.editing_text && ans.cursor_opt == idx;
                 let is_picked = ans.selected_idx == Some(idx);
                 let mark = if is_picked { "●" } else { "○" };
@@ -194,6 +239,7 @@ pub fn draw_elicitation_drawer(frame: &mut Frame, area: Rect, state: &Elicitatio
                 }
             }
             if field.other_key.is_some() {
+                raw_options.push((lines.len(), opts.len(), true));
                 let is_cur = ans.editing_text || ans.cursor_opt == opts.len();
                 let row_y = inner.y + lines.len() as u16;
                 cursor_pos = push_write_in_line(
@@ -209,6 +255,7 @@ pub fn draw_elicitation_drawer(frame: &mut Frame, area: Rect, state: &Elicitatio
         }
         ElicitationFieldKind::MultiSelect { options, .. } => {
             for (idx, opt) in options.iter().enumerate() {
+                raw_options.push((lines.len(), idx, false));
                 let is_cur = !ans.editing_text && ans.cursor_opt == idx;
                 let is_on = ans.checked.get(idx).copied().unwrap_or(false);
                 let mark = if is_on { "[x]" } else { "[ ]" };
@@ -232,6 +279,7 @@ pub fn draw_elicitation_drawer(frame: &mut Frame, area: Rect, state: &Elicitatio
                 }
             }
             if field.other_key.is_some() {
+                raw_options.push((lines.len(), options.len(), true));
                 let is_cur = ans.editing_text || ans.cursor_opt == options.len();
                 let row_y = inner.y + lines.len() as u16;
                 cursor_pos = push_write_in_line(
@@ -247,6 +295,7 @@ pub fn draw_elicitation_drawer(frame: &mut Frame, area: Rect, state: &Elicitatio
         }
         ElicitationFieldKind::Boolean { .. } => {
             for (idx, text) in [" [1] 是 (Yes)", " [2] 否 (No)"].iter().enumerate() {
+                raw_options.push((lines.len(), idx, false));
                 let is_cur = ans.cursor_opt == idx;
                 let is_picked = (idx == 0) == ans.bool_val;
                 let mark = if is_picked { "●" } else { "○" };
@@ -272,7 +321,7 @@ pub fn draw_elicitation_drawer(frame: &mut Frame, area: Rect, state: &Elicitatio
         }
     }
 
-    // 4. 若当前行超出可见高度，围绕激活行滚动窗口
+    // 4. 若当前行超出可见高度，围绕激活行滚动窗口，并换算可见热区屏幕坐标
     let visible_h = usize::from(inner.height);
     let scroll_off = if lines.len() > visible_h {
         let focus_line = lines.len().saturating_sub(1);
@@ -280,6 +329,18 @@ pub fn draw_elicitation_drawer(frame: &mut Frame, area: Rect, state: &Elicitatio
     } else {
         0
     };
+    if scroll_off == 0 && !raw_tabs.is_empty() {
+        for (tx, tw, idx) in raw_tabs {
+            hits.tabs.push((Rect::new(tx, inner.y, tw, 1), idx));
+        }
+    }
+    for (line_idx, opt_idx, is_other) in raw_options {
+        if line_idx >= scroll_off && line_idx < scroll_off + visible_h {
+            let sy = inner.y + (line_idx - scroll_off) as u16;
+            hits.options
+                .push((Rect::new(inner.x, sy, inner.width, 1), opt_idx, is_other));
+        }
+    }
     let rendered: Vec<Line<'static>> = lines.into_iter().skip(scroll_off).take(visible_h).collect();
     frame.render_widget(Paragraph::new(rendered), inner);
 
@@ -289,6 +350,7 @@ pub fn draw_elicitation_drawer(frame: &mut Frame, area: Rect, state: &Elicitatio
             frame.set_cursor_position((cx.min(inner.right().saturating_sub(1)), adj_y));
         }
     }
+    hits
 }
 
 fn push_write_in_line(
@@ -400,7 +462,7 @@ mod tests {
     #[test]
     fn elicitation_drawer_handles_single_write_in_and_multi_select_without_blocking() {
         theme::init(ThemePreset::MiyuLavender, true);
-        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+        let mut app = App::new(None, r"D:\Code\agy-tui".into(), None, true, true);
         app.connecting = false;
         app.busy = true;
 

@@ -5,13 +5,14 @@ mod elicitation;
 mod events;
 mod keyboard;
 mod mouse;
+mod mouse_overlay;
 mod picker;
 mod queue;
 
 pub use elicitation::ElicitationState;
 pub use queue::{InFlightPrompt, QueuedMessage, QueuedMode};
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -63,21 +64,26 @@ impl Default for UserPrefs {
 }
 
 impl UserPrefs {
+    /// 读取用户偏好配置，缺失时依次兼容迁移旧版配置路径。
+    ///
+    /// 返回:
+    /// - 读取并解析成功返回对应 `UserPrefs`，否则返回默认偏好
     pub fn load() -> Self {
-        // 1. 优先读取独立配置路径（$XDG_CONFIG_HOME/litemiyu-acp/prefs.json 或 %APPDATA%\litemiyu-acp\prefs.json）
+        // 1. 优先读取独立配置路径（$XDG_CONFIG_HOME/agy-tui/prefs.json 或 %APPDATA%\agy-tui\prefs.json）
         if let Some(p) = crate::paths::prefs_path()
             && let Ok(s) = std::fs::read_to_string(&p)
             && let Ok(prefs) = serde_json::from_str::<Self>(&s)
         {
             return prefs;
         }
-        // 2. 兼容读取旧版 ~/.gemini/litemiyu-acp.json，并自动落盘迁移到独立配置路径
-        if let Some(legacy) = crate::paths::legacy_prefs_path()
-            && let Ok(s) = std::fs::read_to_string(&legacy)
-            && let Ok(prefs) = serde_json::from_str::<Self>(&s)
-        {
-            prefs.save();
-            return prefs;
+        // 2. 依次兼容读取旧版 litemiyu-acp 配置，并自动落盘迁移到新配置路径
+        for legacy in crate::paths::legacy_prefs_paths() {
+            if let Ok(s) = std::fs::read_to_string(&legacy)
+                && let Ok(prefs) = serde_json::from_str::<Self>(&s)
+            {
+                prefs.save();
+                return prefs;
+            }
         }
         Self::default()
     }
@@ -103,13 +109,14 @@ const LOCAL_COMMANDS: &[(&str, &str)] = &[
     ("new", "开启新会话"),
     ("clear", "清空并开启新会话"),
     ("image", "粘贴剪贴板图片或附加本地图片路径 (/image [路径])"),
-    ("theme", "切换配色主题"),
+    ("theme", "切换配色主题（支持 /theme reload | export [名] | dir）"),
     ("bg", "切换铺底色 / 透明继承终端背景"),
     ("sidebar", "显示 / 隐藏右侧边栏 (Ctrl+B)"),
+    ("todo", "展开 / 收起任务清单 (Ctrl+T)"),
     ("copy", "复制回答原文（/copy [n|all]）；或鼠标直接拖拽划词自动复制"),
     ("mouse", "开关鼠标捕获（关闭后可直接终端划词）"),
     ("help", "查看快捷键与命令帮助"),
-    ("quit", "退出 litemiyu-acp"),
+    ("quit", "退出 agy-tui"),
 ];
 
 #[derive(Debug, Clone)]
@@ -123,6 +130,7 @@ pub struct App {
     pub transcript: Transcript,
     pub editor: InputEditor,
     pub cwd: String,
+    git_branch_cache: Option<(String, Instant, Option<String>)>,
     pub agent_banner: String,
     pub config_options: Vec<ConfigOption>,
     pub modes: Vec<ModeInfo>,
@@ -134,6 +142,8 @@ pub struct App {
     pub pending_resume: Option<String>,
     pub background: BackgroundTracker,
     pub subagents: crate::subagent::Tracker,
+    pub todo_call_ids: HashSet<String>,
+    pub todo_bar_expanded: bool,
     pub busy: bool,
     pub queued_mode: QueuedMode,
     pub queued_messages: VecDeque<QueuedMessage>,
@@ -163,6 +173,7 @@ pub struct App {
     pub dragging: bool,
     pub dragging_scrollbar: bool,
     pub picker: Option<PickerState>,
+    pub theme_preview_origin: Option<(String, bool)>,
     pub permission: Option<(PermissionRequest, usize)>,
     pub elicitation: Option<ElicitationState>,
     pub last_ctrl_c: Option<Instant>,
@@ -184,6 +195,7 @@ impl App {
             transcript: Transcript::new(),
             editor: InputEditor::new(),
             cwd,
+            git_branch_cache: None,
             agent_banner: if demo {
                 "Demo 预览模式（内置样例）".into()
             } else {
@@ -203,6 +215,8 @@ impl App {
             pending_resume,
             background: BackgroundTracker::default(),
             subagents: Default::default(),
+            todo_call_ids: HashSet::new(),
+            todo_bar_expanded: true,
             busy: false,
             queued_mode: QueuedMode::default(),
             queued_messages: VecDeque::new(),
@@ -232,6 +246,7 @@ impl App {
             dragging: false,
             dragging_scrollbar: false,
             picker: None,
+            theme_preview_origin: None,
             permission: None,
             elicitation: None,
             last_ctrl_c: None,
@@ -281,6 +296,24 @@ impl App {
             "请给出无限工作台重启锁屏无锁图标的根因修复方案汇总。".into(),
             Vec::new(),
         );
+        self.transcript.update_plan(vec![
+            crate::acp::PlanItem {
+                content: "定位锁屏过渡动画冷订阅状态流".into(),
+                status: "completed".into(),
+            },
+            crate::acp::PlanItem {
+                content: "补齐 OFF -> LOCKSCREEN 终态输出".into(),
+                status: "completed".into(),
+            },
+            crate::acp::PlanItem {
+                content: "补充 DeviceEntryIconViewModel 归并条件".into(),
+                status: "in_progress".into(),
+            },
+            crate::acp::PlanItem {
+                content: "汇总验证步骤与回归检查项".into(),
+                status: "pending".into(),
+            },
+        ]);
         self.transcript.append_thought(
             "检查 OffToLockscreenTransitionViewModel 与 DeviceEntryIconViewModel：\n\
              1. OffToLockscreenTransitionViewModel 缺少 onFinish = { 1f }，导致冷订阅晚于 FINISHED 时停留在 0f。\n\
@@ -544,6 +577,20 @@ impl App {
         )
     }
 
+    /// 返回当前工作目录的 Git 分支名（按目录缓存 2 秒，零子进程开销）。
+    fn current_git_branch(&mut self) -> Option<String> {
+        let now = Instant::now();
+        if let Some((cached_cwd, at, branch)) = &self.git_branch_cache
+            && cached_cwd == &self.cwd
+            && now.duration_since(*at) < Duration::from_secs(2)
+        {
+            return branch.clone();
+        }
+        let detected = crate::paths::git_branch_in(std::path::Path::new(&self.cwd));
+        self.git_branch_cache = Some((self.cwd.clone(), now, detected.clone()));
+        detected
+    }
+
     pub fn render(&mut self, frame: &mut ratatui::Frame) {
         let completion_menu = self.active_completion_menu();
         if let Some(menu) = &completion_menu {
@@ -553,6 +600,7 @@ impl App {
         } else {
             self.completion_selected = 0;
         }
+        let git_branch = self.current_git_branch();
         let model = self.model_label();
         let effort = self.effort_label();
         let mode = self.mode_label();
@@ -571,6 +619,7 @@ impl App {
             transcript: &self.transcript,
             editor: &self.editor,
             cwd: &self.cwd,
+            git_branch: git_branch.as_deref(),
             agent_banner: &self.agent_banner,
             model_label: &model,
             effort_label: &effort,
@@ -581,6 +630,7 @@ impl App {
             scroll: self.scroll,
             auto_follow: self.auto_follow,
             show_sidebar: self.show_sidebar,
+            todo_bar_expanded: self.todo_bar_expanded,
             tick: self.tick,
             started_at: self.started_at,
             toast,
@@ -615,7 +665,7 @@ impl App {
 
     pub(super) fn save_prefs(&self) {
         let prefs = UserPrefs {
-            theme: theme::current_preset().id().to_string(),
+            theme: theme::current_theme_id(),
             paint_bg: theme::paint_bg(),
             show_sidebar: self.show_sidebar,
             queued_mode: self.queued_mode,

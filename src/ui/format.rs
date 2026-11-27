@@ -176,7 +176,7 @@ mod tests {
         assert!(parse_timestamp_secs("2026-11-24T08:30:00Z").is_some());
         assert_eq!(parse_timestamp_secs("1700000000"), Some(1700000000));
         assert_eq!(parse_timestamp_secs("1700000000123"), Some(1700000000));
-        assert!(same_directory(r"D:\Code\litemiyu-acp\", "D:/Code/litemiyu-acp"));
+        assert!(same_directory(r"D:\Code\agy-tui\", "D:/Code/agy-tui"));
         let short = shorten_path_left(r"D:\very\long\workspace\path\my-project", 18);
         assert!(short.ends_with("my-project"), "should keep tail: {short}");
         assert!(short.starts_with('…'));

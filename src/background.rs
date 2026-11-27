@@ -88,10 +88,11 @@ impl BackgroundTracker {
             return None;
         }
 
-        // 1. 交互式提问工具与子代理/多代理工具由各自专属模块处理，不纳入通用后台命令追踪
+        // 1. 交互式提问、子代理/多代理与任务清单工具由各自专属模块处理，不纳入通用后台命令追踪
         let raw_name = name.unwrap_or("");
         if is_interactive_question_tool(raw_name)
             || crate::subagent::is_subagent_family_tool(raw_name)
+            || crate::todo::is_todo_tool(raw_name)
         {
             self.ignored_calls.insert(call_id.to_string());
             if let Some(pos) = self.active.iter().position(|t| t.call_id == call_id) {

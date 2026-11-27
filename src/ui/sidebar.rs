@@ -15,6 +15,7 @@ use crate::acp::SessionSummary;
 use crate::background::BackgroundTask;
 use crate::linebreak;
 use crate::theme;
+use crate::todo::{self, TodoStatus};
 use crate::transcript::{Transcript, format_short, short_id};
 use crate::ui::HoverTarget;
 use crate::ui::activity;
@@ -27,6 +28,8 @@ const BG_SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
 pub struct SidebarHits {
     pub area: Rect,
     pub context_area: Rect,
+    pub todo_area: Rect,
+    pub todo_entry_id: Option<u64>,
     pub bg_rows: Vec<(u16, u64)>,         // (screen_y, entry_id)
     pub subagent_rows: Vec<(u16, u64)>,
     pub jump_rows: Vec<(u16, u64)>,       // (screen_y, entry_id)
@@ -38,6 +41,8 @@ pub struct SidebarData<'a> {
     pub cwd: &'a str,
     pub mode_label: &'a str,
     pub tier: Option<&'a str>,
+    pub busy: bool,
+    pub tick: usize,
     pub current_user_entry: Option<u64>,
     pub background_tasks: &'a [BackgroundTask],
     pub subagents: &'a [crate::subagent::Agent],
@@ -177,6 +182,92 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
                 theme::faint(),
             ));
         }
+    }
+
+    // 2.6 任务清单（实时跟踪 agy `update_steps` 与标准 ACP `plan`，点击定位到时间线任务卡片）
+    let mut todo_rows: Option<(usize, usize)> = None;
+    if !data.transcript.latest_plan.is_empty() {
+        lines.push(Line::default());
+        let todo_start = lines.len();
+        let todo_hover = matches!(data.hover, HoverTarget::SidebarTodo);
+        let row_bg = if todo_hover {
+            Style::new().bg(hover_bg)
+        } else {
+            Style::new()
+        };
+        let counts = todo::count_items(&data.transcript.latest_plan);
+        let all_done = counts.all_done();
+        let title_style = if todo_hover {
+            theme::accent_bold().patch(row_bg)
+        } else if all_done {
+            theme::good()
+        } else {
+            theme::side_title()
+        };
+        let count_style = if all_done {
+            theme::good().patch(row_bg)
+        } else if counts.failed > 0 {
+            theme::error().patch(row_bg)
+        } else {
+            theme::accent().patch(row_bg)
+        };
+        lines.push(pad_hover_line(
+            vec![
+                Span::styled("任务清单", title_style),
+                Span::styled(
+                    format!(" ({}/{})", counts.finished(), counts.total),
+                    count_style,
+                ),
+            ],
+            w,
+            todo_hover,
+            hover_bg,
+        ));
+        let (window, above, below) = todo::visible_window(&data.transcript.latest_plan, 6);
+        let text_room = w.saturating_sub(4).max(4);
+        if above > 0 {
+            lines.push(pad_hover_line(
+                vec![Span::styled(
+                    format!("  … 上方 {above} 项"),
+                    theme::faint().patch(row_bg),
+                )],
+                w,
+                todo_hover,
+                hover_bg,
+            ));
+        }
+        for item in window {
+            let st = todo::parse_status(&item.status);
+            let (sym, sym_style, text_style) =
+                todo::status_visual(st, data.busy && st == TodoStatus::InProgress, data.tick);
+            let shown_text_style = if todo_hover {
+                theme::text().patch(row_bg)
+            } else {
+                text_style.patch(row_bg)
+            };
+            lines.push(pad_hover_line(
+                vec![
+                    Span::styled("  ", row_bg),
+                    Span::styled(format!("{sym} "), sym_style.patch(row_bg)),
+                    Span::styled(linebreak::clip(&item.content, text_room), shown_text_style),
+                ],
+                w,
+                todo_hover,
+                hover_bg,
+            ));
+        }
+        if below > 0 {
+            lines.push(pad_hover_line(
+                vec![Span::styled(
+                    format!("  … 其余 {below} 项"),
+                    theme::faint().patch(row_bg),
+                )],
+                w,
+                todo_hover,
+                hover_bg,
+            ));
+        }
+        todo_rows = Some((todo_start, lines.len()));
     }
 
     // 3. 上下文（整段可点击查看状态/触发压缩）
@@ -371,6 +462,18 @@ pub fn draw(frame: &mut Frame, area: Rect, data: &SidebarData<'_>) -> SidebarHit
     let max_h = usize::from(inner.height);
     hits.subagent_rows.extend(subagent_marks.into_iter().filter(|(row, _)| *row < max_h)
         .map(|(row, entry)| (inner.y + row as u16, entry)));
+    if let Some((start, end)) = todo_rows
+        && start < max_h
+    {
+        let shown_end = end.min(max_h);
+        hits.todo_area = Rect::new(
+            inner.x,
+            inner.y + start as u16,
+            inner.width,
+            (shown_end - start) as u16,
+        );
+        hits.todo_entry_id = data.transcript.latest_plan_entry_id;
+    }
     if let Some((start, end)) = context_rows
         && start < max_h {
             let shown_end = end.min(max_h);

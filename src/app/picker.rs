@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::acp::{AcpCommand, SessionSummary};
 use crate::clipboard;
-use crate::theme::{self, ThemePreset};
+use crate::theme;
 use crate::transcript::short_id;
 use crate::ui::overlay::{
     PickerItem, PickerKind, PickerState, ResumeScope, format_relative_time, parse_timestamp_secs,
@@ -62,7 +62,7 @@ impl App {
         }
     }
 
-    fn answer_permission(&mut self, option_id: Option<String>) {
+    pub(super) fn answer_permission(&mut self, option_id: Option<String>) {
         if let Some((req, _)) = self.permission.take()
             && let Some(client) = &self.client {
                 client.send(AcpCommand::AnswerPermission {
@@ -76,17 +76,31 @@ impl App {
         let Some(picker) = &mut self.picker else {
             return;
         };
+        let mut selection_moved = false;
         match key.code {
             KeyCode::Esc => {
-                self.picker = None;
+                self.dismiss_picker();
+                return;
             }
             KeyCode::Tab | KeyCode::BackTab if picker.kind == PickerKind::Resume => {
                 picker.toggle_scope();
             }
-            KeyCode::Up => picker.move_up(),
-            KeyCode::Down => picker.move_down(),
-            KeyCode::PageUp => picker.page_up(5),
-            KeyCode::PageDown => picker.page_down(5),
+            KeyCode::Up => {
+                picker.move_up();
+                selection_moved = true;
+            }
+            KeyCode::Down => {
+                picker.move_down();
+                selection_moved = true;
+            }
+            KeyCode::PageUp => {
+                picker.page_up(5);
+                selection_moved = true;
+            }
+            KeyCode::PageDown => {
+                picker.page_down(5);
+                selection_moved = true;
+            }
             KeyCode::Backspace
                 if !matches!(
                     picker.kind,
@@ -95,6 +109,7 @@ impl App {
             {
                 picker.query.pop();
                 picker.selected = 0;
+                selection_moved = true;
             }
             KeyCode::Char(c)
                 if !matches!(
@@ -106,20 +121,58 @@ impl App {
             {
                 picker.query.push(c);
                 picker.selected = 0;
+                selection_moved = true;
             }
             KeyCode::Enter => {
-                let kind = picker.kind;
-                let chosen = picker.selected_item().cloned();
-                self.picker = None;
-                if let Some(item) = chosen {
-                    self.apply_picker_choice(kind, item);
-                }
+                self.confirm_picker_selection();
+                return;
             }
             _ => {}
         }
+        if selection_moved {
+            self.preview_selected_theme();
+        }
     }
 
-    fn apply_picker_choice(&mut self, kind: PickerKind, item: PickerItem) {
+    /// 取消并关闭当前模态选择器；若处于主题实时预览状态则还原原主题与背景设置。
+    pub(super) fn dismiss_picker(&mut self) {
+        self.picker = None;
+        if let Some((orig_id, orig_paint_bg)) = self.theme_preview_origin.take() {
+            theme::restore_state(&orig_id, orig_paint_bg);
+        }
+    }
+
+    /// 在主题选择器中实时预览当前高亮条目，不写入用户偏好文件。
+    pub(super) fn preview_selected_theme(&mut self) {
+        let Some(picker) = &self.picker else {
+            return;
+        };
+        if picker.kind != PickerKind::Theme {
+            return;
+        }
+        let Some((_, orig_paint_bg)) = &self.theme_preview_origin else {
+            return;
+        };
+        if let Some(item) = picker.selected_item() {
+            let _ = theme::preview_by_id(&item.id, *orig_paint_bg);
+        }
+    }
+
+    /// 确认并执行当前模态选择器中的高亮条目，随后关闭弹窗。
+    pub(super) fn confirm_picker_selection(&mut self) {
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        let kind = picker.kind;
+        if let Some(item) = picker.selected_item().cloned() {
+            self.theme_preview_origin = None;
+            self.apply_picker_choice(kind, item);
+        } else if let Some((orig_id, orig_paint_bg)) = self.theme_preview_origin.take() {
+            theme::restore_state(&orig_id, orig_paint_bg);
+        }
+    }
+
+    pub(super) fn apply_picker_choice(&mut self, kind: PickerKind, item: PickerItem) {
         match kind {
             PickerKind::Model => {
                 self.set_config_option("model", &item.id);
@@ -137,10 +190,9 @@ impl App {
                 self.load_session(item.id);
             }
             PickerKind::Theme => {
-                if let Some(preset) = ThemePreset::parse(&item.id) {
-                    theme::set_preset(preset);
+                if let Some(label) = theme::set_by_id(&item.id) {
                     self.save_prefs();
-                    self.toast(format!("已切换主题：{}", preset.label()), false);
+                    self.toast(format!("已切换主题：{label}"), false);
                 }
             }
             PickerKind::Status => match item.id.as_str() {
@@ -314,18 +366,25 @@ impl App {
     }
 
     pub(super) fn open_theme_picker(&mut self) {
-        let cur = theme::current_preset();
-        let items: Vec<PickerItem> = ThemePreset::ALL
-            .iter()
-            .map(|&p| PickerItem::simple(p.id(), p.label(), p.id(), p == cur))
+        // 1. 每次打开时自动扫描自定义主题目录，保证新增/编辑的 JSON 即刻可见
+        let custom_count = theme::reload_custom_themes();
+        let cur_id = theme::current_theme_id();
+        self.theme_preview_origin = Some((cur_id.clone(), theme::paint_bg()));
+        let list = theme::list_themes();
+        let items: Vec<PickerItem> = list
+            .into_iter()
+            .map(|t| {
+                let active = t.id.eq_ignore_ascii_case(&cur_id);
+                PickerItem::simple(t.id, t.label, t.detail, active)
+            })
             .collect();
         let selected = items.iter().position(|i| i.active).unwrap_or(0);
-        self.picker = Some(PickerState::new(
-            PickerKind::Theme,
-            "选择配色主题",
-            items,
-            selected,
-        ));
+        let title = if custom_count > 0 {
+            format!("选择配色主题（含 {custom_count} 套自定义 · 上下实时预览）")
+        } else {
+            "选择配色主题（上下实时预览 · /theme export 导出自定义模板）".to_string()
+        };
+        self.picker = Some(PickerState::new(PickerKind::Theme, title, items, selected));
     }
 
     pub(super) fn open_status_picker(&mut self) {
@@ -393,12 +452,13 @@ impl App {
             ("/image [路径]", "手动粘贴剪贴板图片或附加指定本地图片"),
             ("Shift + Tab", "快速循环切换执行模式 (default / accept-edits / plan)"),
             ("Ctrl + B", "显示 / 隐藏右侧边栏"),
+            ("Ctrl + T / /todo", "展开 / 收起任务清单（支持 agy update_steps 与 ACP plan）"),
             ("Ctrl + O", "展开 / 折叠全部思考过程与长 Diff / 工具详情"),
             ("PgUp / PgDn / 滚轮", "滚动对话内容；End 回到底部恢复跟随"),
             ("Esc", "中断当前生成 / 关闭浮层 / 清空输入框"),
             ("/model · /effort · /mode", "交互式切换模型、思考等级、执行模式"),
             ("/resume · /new", "按当前目录/全部与最近时间搜索恢复会话（Tab 切换范围）"),
-            ("/theme · /bg", "切换 6 套 MD3/TokyoNight/暖纸浅色配色 / 开关透明背景"),
+            ("/theme · /bg", "14 套内置配色 + 自定义 JSON (/theme export|reload|dir) / 透明背景"),
             ("/copy [n|all] · /mouse", "复制回答原文 / 开关鼠标捕获；直接左键拖选松手自动复制"),
             ("鼠标拖拽 / 点击", "左键拖选正文或侧边栏松手即复制（不串栏）；点击展开或开链接"),
         ];
@@ -408,7 +468,7 @@ impl App {
             .collect();
         self.picker = Some(PickerState::new(
             PickerKind::Help,
-            "litemiyu-acp 快捷键与命令帮助",
+            "agy-tui 快捷键与命令帮助",
             items,
             0,
         ));

@@ -83,9 +83,15 @@ pub(super) fn parse_session_update(u: &Value) -> Option<SessionUpdate> {
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|e| {
+                            let content = e["content"]
+                                .as_str()
+                                .or_else(|| e["title"].as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())?;
+                            let raw_status = e["status"].as_str().unwrap_or("pending");
                             Some(PlanItem {
-                                content: e["content"].as_str()?.to_string(),
-                                status: e["status"].as_str().unwrap_or("pending").to_string(),
+                                content: content.to_string(),
+                                status: crate::todo::normalize_status(raw_status).to_string(),
                             })
                         })
                         .collect()

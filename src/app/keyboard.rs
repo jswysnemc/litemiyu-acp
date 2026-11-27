@@ -69,6 +69,11 @@ impl App {
             self.editor.move_to_end();
             return;
         }
+        if is_ctrl_char(key.code, key.modifiers, 't') {
+            self.windows_paste.reset();
+            self.toggle_todo_bar();
+            return;
+        }
         if is_ctrl_char(key.code, key.modifiers, 'v')
             || (matches!(key.code, KeyCode::Char('v' | 'V'))
                 && key.modifiers == KeyModifiers::ALT)
@@ -511,7 +516,7 @@ mod tests {
 
     #[test]
     fn ctrl_a_ctrl_e_and_ctrl_g_shortcuts_work_on_multiline_input() {
-        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+        let mut app = App::new(None, r"D:\Code\agy-tui".into(), None, true, true);
         app.editor.set_text("line1\nline2\nline3");
 
         // Ctrl+A 回到整个输入框最开头（即便在多行末尾）
@@ -543,7 +548,7 @@ mod tests {
 
     #[test]
     fn shift_enter_and_lf_insert_newline_without_submitting() {
-        let mut app = App::new(None, r"D:\Code\litemiyu-acp".into(), None, true, true);
+        let mut app = App::new(None, r"D:\Code\agy-tui".into(), None, true, true);
         let initial_entries = app.transcript.entries.len();
         app.editor.set_text("第一行");
 
