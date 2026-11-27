@@ -1,40 +1,138 @@
 //! 客户端自身的配置与缓存目录解析（与具体 ACP 后端完全解耦，不写入 `~/.gemini`）。
 //! - Unix 遵循 XDG Base Directory 规范（`$XDG_CONFIG_HOME` / `$XDG_CACHE_HOME`）
 //! - Windows 使用 `%APPDATA%` / `%LOCALAPPDATA%`
-//! - 保留对旧版 `~/.gemini/litemiyu-acp.json` 的只读兼容回退
+//! - 保留对旧版 `litemiyu-acp` 配置路径及 `~/.gemini/litemiyu-acp.json` 的只读兼容回退
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-const APP_DIR_NAME: &str = "litemiyu-acp";
+const APP_DIR_NAME: &str = "agy-tui";
+const LEGACY_APP_DIR_NAME: &str = "litemiyu-acp";
 
 /// 返回用户偏好配置文件路径。
 ///
 /// 返回:
-/// - Unix: `$XDG_CONFIG_HOME/litemiyu-acp/prefs.json` 或 `~/.config/litemiyu-acp/prefs.json`
-/// - Windows: `%APPDATA%\litemiyu-acp\prefs.json`（缺失时回退 `%USERPROFILE%\.config\litemiyu-acp\prefs.json`）
+/// - Unix: `$XDG_CONFIG_HOME/agy-tui/prefs.json` 或 `~/.config/agy-tui/prefs.json`
+/// - Windows: `%APPDATA%\agy-tui\prefs.json`（缺失时回退 `%USERPROFILE%\.config\agy-tui\prefs.json`）
 pub fn prefs_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("prefs.json"))
 }
 
-/// 返回旧版配置文件路径（仅用于首次升级时的兼容读取，不再写入）。
+/// 返回用户自定义主题目录路径。
 ///
 /// 返回:
-/// - 旧版 `~/.gemini/litemiyu-acp.json` 路径
-pub fn legacy_prefs_path() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".gemini").join("litemiyu-acp.json"))
+/// - Unix: `$XDG_CONFIG_HOME/agy-tui/themes` 或 `~/.config/agy-tui/themes`
+/// - Windows: `%APPDATA%\agy-tui\themes`（缺失时回退 `%USERPROFILE%\.config\agy-tui\themes`）
+pub fn themes_dir() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("themes"))
+}
+
+/// 按优先级返回旧版配置文件候选路径（仅用于首次升级时的只读兼容迁移，不再写入）。
+///
+/// 返回:
+/// - 依次包含旧版独立目录 `litemiyu-acp/prefs.json` 与早期 `~/.gemini/litemiyu-acp.json`
+pub fn legacy_prefs_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    // 1. 优先检查更名之前的独立配置目录 litemiyu-acp/prefs.json
+    if let Some(dir) = config_dir_for(LEGACY_APP_DIR_NAME) {
+        paths.push(dir.join("prefs.json"));
+    }
+    // 2. 回退检查最早期的 ~/.gemini/litemiyu-acp.json
+    if let Some(home) = home_dir() {
+        paths.push(home.join(".gemini").join("litemiyu-acp.json"));
+    }
+    paths
 }
 
 /// 返回剪贴板截图落盘缓存目录。
 ///
 /// 返回:
-/// - Unix: `$XDG_CACHE_HOME/litemiyu-acp/clips` 或 `~/.cache/litemiyu-acp/clips`
-/// - Windows: `%LOCALAPPDATA%\litemiyu-acp\clips`（回退系统临时目录）
+/// - Unix: `$XDG_CACHE_HOME/agy-tui/clips` 或 `~/.cache/agy-tui/clips`
+/// - Windows: `%LOCALAPPDATA%\agy-tui\clips`（回退系统临时目录）
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn clip_cache_dir() -> Option<PathBuf> {
     cache_dir()
         .map(|d| d.join("clips"))
         .or_else(|| Some(std::env::temp_dir().join(APP_DIR_NAME).join("clips")))
+}
+
+/// 折叠用户主目录前缀为 `~`（仅匹配完整路径边界，避免误替换相似前缀）。
+///
+/// 参数:
+/// - `path`: 原始目录字符串
+///
+/// 返回:
+/// - 若以当前用户主目录开头，返回 `~` 缩写路径，否则原样返回
+pub fn collapse_home_dir(path: &str) -> String {
+    let Some(home) = home_dir() else {
+        return path.to_string();
+    };
+    let home_str = home.to_string_lossy();
+    let trimmed_home = home_str.trim_end_matches(['/', '\\']);
+    if trimmed_home.is_empty() {
+        return path.to_string();
+    }
+    if path == trimmed_home {
+        return "~".to_string();
+    }
+    if let Some(rest) = path.strip_prefix(trimmed_home)
+        && (rest.starts_with('/') || rest.starts_with('\\'))
+    {
+        return format!("~{rest}");
+    }
+    path.to_string()
+}
+
+/// 纯文件读取方式探测给定目录所在的 Git 分支名（零子进程开销，支持普通仓库与 worktree/submodule）。
+///
+/// 参数:
+/// - `dir`: 工作区目录路径
+///
+/// 返回:
+/// - 处于命名分支时返回分支名（如 `main`）
+/// - 处于游离 HEAD 时返回 `@<前7位哈希>`
+/// - 非 Git 仓库或读取失败时返回 `None`
+pub fn git_branch_in(dir: &Path) -> Option<String> {
+    // 1. 沿祖先目录向上查找 `.git`（目录或 worktree/submodule 指针文件）
+    let mut cur = Some(dir);
+    let git_dir = loop {
+        let candidate = cur?.join(".git");
+        if candidate.is_dir() {
+            break candidate;
+        }
+        if candidate.is_file() {
+            let content = std::fs::read_to_string(&candidate).ok()?;
+            let first = content.lines().next()?.trim();
+            let raw_target = first.strip_prefix("gitdir:")?.trim();
+            if raw_target.is_empty() {
+                return None;
+            }
+            let target = PathBuf::from(raw_target);
+            break if target.is_absolute() {
+                target
+            } else {
+                cur?.join(target)
+            };
+        }
+        cur = cur?.parent();
+    };
+
+    // 2. 读取 HEAD 文件解析当前分支或游离提交短哈希
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let line = head.lines().next()?.trim();
+    if let Some(ref_path) = line.strip_prefix("ref:") {
+        let trimmed = ref_path.trim();
+        let branch = trimmed
+            .strip_prefix("refs/heads/")
+            .or_else(|| trimmed.strip_prefix("refs/tags/"))
+            .or_else(|| trimmed.rsplit('/').next())
+            .unwrap_or(trimmed);
+        return (!branch.is_empty()).then(|| branch.to_string());
+    }
+    if line.len() >= 7 && line.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(format!("@{}", &line[..7]));
+    }
+    None
 }
 
 /// 返回 agy 本地会话脑目录（仅用于只读观察子代理与父会话 `transcript.jsonl`，绝不写入）。
@@ -181,11 +279,23 @@ fn percent_decode(input: &str) -> Option<String> {
 }
 
 fn config_dir() -> Option<PathBuf> {
-    resolve_config_dir(
+    config_dir_for(APP_DIR_NAME)
+}
+
+/// 按给定应用目录名解析当前平台的配置根目录。
+///
+/// 参数:
+/// - `app_dir_name`: 应用配置子目录名
+///
+/// 返回:
+/// - 平台对应的配置目录路径
+fn config_dir_for(app_dir_name: &str) -> Option<PathBuf> {
+    resolve_config_dir_for(
         cfg!(windows),
         std::env::var_os("APPDATA"),
         std::env::var_os("XDG_CONFIG_HOME"),
         home_dir(),
+        app_dir_name,
     )
 }
 
@@ -206,20 +316,31 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+#[cfg(test)]
 fn resolve_config_dir(
     is_windows: bool,
     appdata: Option<OsString>,
     xdg_config: Option<OsString>,
     home: Option<PathBuf>,
 ) -> Option<PathBuf> {
+    resolve_config_dir_for(is_windows, appdata, xdg_config, home, APP_DIR_NAME)
+}
+
+fn resolve_config_dir_for(
+    is_windows: bool,
+    appdata: Option<OsString>,
+    xdg_config: Option<OsString>,
+    home: Option<PathBuf>,
+    app_dir_name: &str,
+) -> Option<PathBuf> {
     if is_windows {
         if let Some(dir) = appdata.filter(|s| !s.is_empty()) {
-            return Some(PathBuf::from(dir).join(APP_DIR_NAME));
+            return Some(PathBuf::from(dir).join(app_dir_name));
         }
     } else if let Some(dir) = xdg_config.filter(|s| !s.is_empty()) {
-        return Some(PathBuf::from(dir).join(APP_DIR_NAME));
+        return Some(PathBuf::from(dir).join(app_dir_name));
     }
-    home.map(|h| h.join(".config").join(APP_DIR_NAME))
+    home.map(|h| h.join(".config").join(app_dir_name))
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -247,16 +368,25 @@ mod tests {
     fn resolves_xdg_and_default_unix_paths_without_gemini_dir() {
         let home = Some(PathBuf::from("/home/tester"));
         let xdg_cfg = resolve_config_dir(false, None, Some(OsString::from("/etc/xdg-user")), home.clone());
-        assert_eq!(xdg_cfg, Some(PathBuf::from("/etc/xdg-user/litemiyu-acp")));
+        assert_eq!(xdg_cfg, Some(PathBuf::from("/etc/xdg-user/agy-tui")));
 
         let def_cfg = resolve_config_dir(false, None, None, home.clone());
-        assert_eq!(def_cfg, Some(PathBuf::from("/home/tester/.config/litemiyu-acp")));
+        assert_eq!(def_cfg, Some(PathBuf::from("/home/tester/.config/agy-tui")));
+
+        let legacy_cfg = resolve_config_dir_for(
+            false,
+            None,
+            Some(OsString::from("/etc/xdg-user")),
+            home.clone(),
+            LEGACY_APP_DIR_NAME,
+        );
+        assert_eq!(legacy_cfg, Some(PathBuf::from("/etc/xdg-user/litemiyu-acp")));
 
         let xdg_cache = resolve_cache_dir(false, None, Some(OsString::from("/tmp/cache")), home.clone());
-        assert_eq!(xdg_cache, Some(PathBuf::from("/tmp/cache/litemiyu-acp")));
+        assert_eq!(xdg_cache, Some(PathBuf::from("/tmp/cache/agy-tui")));
 
         let def_cache = resolve_cache_dir(false, None, None, home);
-        assert_eq!(def_cache, Some(PathBuf::from("/home/tester/.cache/litemiyu-acp")));
+        assert_eq!(def_cache, Some(PathBuf::from("/home/tester/.cache/agy-tui")));
     }
 
     #[test]
@@ -270,7 +400,7 @@ mod tests {
         );
         assert_eq!(
             cfg,
-            Some(PathBuf::from(r"C:\Users\tester\AppData\Roaming").join("litemiyu-acp"))
+            Some(PathBuf::from(r"C:\Users\tester\AppData\Roaming").join("agy-tui"))
         );
 
         let cache = resolve_cache_dir(
@@ -281,7 +411,7 @@ mod tests {
         );
         assert_eq!(
             cache,
-            Some(PathBuf::from(r"C:\Users\tester\AppData\Local").join("litemiyu-acp"))
+            Some(PathBuf::from(r"C:\Users\tester\AppData\Local").join("agy-tui"))
         );
     }
 
@@ -313,5 +443,43 @@ mod tests {
             Some(PathBuf::from(r"C:\Users\demo\transcript.jsonl"))
         );
         assert!(parse_file_uri_for_platform("https://example.com/a", false).is_none());
+    }
+
+    #[test]
+    fn detects_git_branch_detached_head_and_worktree_gitdir() {
+        let base = std::env::temp_dir().join(format!("agy_tui_git_branch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // 1. 普通仓库命名分支（子目录内向上查找）
+        let repo = base.join("repo");
+        let sub = repo.join("src/ui");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feat/theme-colors\n").unwrap();
+        assert_eq!(git_branch_in(&sub).as_deref(), Some("feat/theme-colors"));
+
+        // 2. 游离 HEAD 返回 @ 前 7 位短哈希
+        std::fs::write(
+            repo.join(".git/HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        assert_eq!(git_branch_in(&repo).as_deref(), Some("@0123456"));
+
+        // 3. worktree 形式（.git 文件指向独立 gitdir）
+        let wt = base.join("wt");
+        let wt_git = base.join("wt-gitdir");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
+        std::fs::write(wt_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(git_branch_in(&wt).as_deref(), Some("main"));
+
+        // 4. 非 Git 目录返回 None
+        let plain = base.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(git_branch_in(&plain), None);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
