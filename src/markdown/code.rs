@@ -77,160 +77,7 @@ pub fn find_language(name: &str) -> Option<&'static Language> {
         .find(|l| l.names.iter().any(|n| n.eq_ignore_ascii_case(&key)))
 }
 
-/// 为运行的终端命令推断最合适的 Shell 语法（参考 `sai/src/render/command_highlight.rs`）。
-pub fn detect_shell_language(command: &str) -> &'static str {
-    let lower = command.to_ascii_lowercase();
-    let looks_powershell = lower.contains("get-")
-        || lower.contains("set-")
-        || lower.contains("select-object")
-        || lower.contains("where-object")
-        || lower.contains("foreach-object")
-        || lower.contains("convertfrom-")
-        || lower.contains("convertto-")
-        || lower.contains("write-host")
-        || lower.contains("$env:")
-        || lower.contains("pwsh")
-        || lower.contains("powershell");
-    let looks_posix = lower.contains("export ")
-        || lower.contains("grep ")
-        || lower.contains("awk ")
-        || lower.contains("sed ")
-        || lower.starts_with("#!/");
-    if looks_powershell {
-        "powershell"
-    } else if looks_posix {
-        "bash"
-    } else if cfg!(windows) {
-        "powershell"
-    } else {
-        "bash"
-    }
-}
-
-/// 对单行 Shell 命令做语法着色（参考 `sai`：命令名、参数标志、字符串、变量、数字、管道与操作符分层着色）。
-pub fn highlight_shell_line(line: &str, lang_name: Option<&str>) -> Vec<Piece> {
-    let lang = lang_name
-        .unwrap_or_else(|| detect_shell_language(line))
-        .to_string();
-    let mut hl = Highlighter::new(find_language(&lang).or_else(|| find_language("bash")));
-    let raw = hl.line(line);
-    emphasize_command_heads(raw)
-}
-
-/// 将每段命令首位的可执行程序/Cmdlet（行首或 `|`, `&&`, `||`, `;`, `(` 之后）高亮为函数色。
-fn emphasize_command_heads(pieces: Vec<Piece>) -> Vec<Piece> {
-    let plain = theme::text();
-    let cmd_style = theme::code_function();
-    let mut out: Vec<Piece> = Vec::with_capacity(pieces.len() + 4);
-    let mut expect_cmd = true;
-    let mut in_cmd_word = false;
-
-    for piece in pieces {
-        if piece.style == theme::code_comment() {
-            out.push(piece);
-            continue;
-        }
-        if piece.style == theme::code_operator() {
-            let trimmed = piece.text.trim();
-            if in_cmd_word && trimmed == "-" {
-                // 连字符命令名（如 `Get-ChildItem`、`docker-compose`）延续命令高亮
-                out.push(Piece::new(piece.text, cmd_style));
-                continue;
-            }
-            if trimmed.contains('|')
-                || trimmed.contains('&')
-                || trimmed.contains(';')
-                || trimmed == "&&"
-                || trimmed == "||"
-            {
-                expect_cmd = true;
-                in_cmd_word = false;
-            } else {
-                in_cmd_word = false;
-            }
-            out.push(piece);
-            continue;
-        }
-
-        if piece.style == plain {
-            // 将普通文本按空白和命令分隔符切片，精准标亮命令首词
-            let mut idx = 0;
-            let bytes = piece.text.as_bytes();
-            while idx < bytes.len() {
-                let ch = piece.text[idx..].chars().next().unwrap_or(' ');
-                if ch.is_whitespace() {
-                    let start = idx;
-                    while idx < bytes.len() {
-                        let c = piece.text[idx..].chars().next().unwrap_or(' ');
-                        if !c.is_whitespace() {
-                            break;
-                        }
-                        idx += c.len_utf8();
-                    }
-                    in_cmd_word = false;
-                    push_merged(&mut out, &piece.text[start..idx], plain);
-                } else if matches!(ch, ';' | '(' | '{') {
-                    let end = idx + ch.len_utf8();
-                    push_merged(&mut out, &piece.text[idx..end], theme::code_operator());
-                    expect_cmd = true;
-                    in_cmd_word = false;
-                    idx = end;
-                } else {
-                    let start = idx;
-                    while idx < bytes.len() {
-                        let c = piece.text[idx..].chars().next().unwrap_or(' ');
-                        if c.is_whitespace() || matches!(c, ';' | '(' | '{') {
-                            break;
-                        }
-                        idx += c.len_utf8();
-                    }
-                    let token = &piece.text[start..idx];
-                    if expect_cmd || in_cmd_word {
-                        // 环境变量赋值 `FOO=bar` 后仍等待真正命令名
-                        let is_env_assign = token.contains('=') && !token.starts_with('=');
-                        let st = if is_env_assign {
-                            theme::code_property()
-                        } else {
-                            expect_cmd = false;
-                            in_cmd_word = true;
-                            cmd_style
-                        };
-                        push_merged(&mut out, token, st);
-                    } else {
-                        push_merged(&mut out, token, plain);
-                    }
-                }
-            }
-            continue;
-        }
-
-        // 其他已着色 token（如关键字、参数、字符串、变量）出现后，结束当前命令首词期待
-        if piece.style == theme::code_keyword() {
-            // `if` / `then` / `do` / `else` 后面的下一个词往往仍是命令
-            let kw = piece.text.trim().to_ascii_lowercase();
-            expect_cmd = matches!(kw.as_str(), "if" | "then" | "elif" | "else" | "do" | "while" | "until");
-            in_cmd_word = false;
-        } else if !in_cmd_word {
-            expect_cmd = false;
-        } else {
-            in_cmd_word = false;
-        }
-        push_merged(&mut out, &piece.text, piece.style);
-    }
-    out
-}
-
-fn push_merged(out: &mut Vec<Piece>, text: &str, style: Style) {
-    if text.is_empty() {
-        return;
-    }
-    if let Some(last) = out.last_mut()
-        && last.style == style && last.link.is_none() {
-            last.text.push_str(text);
-            return;
-        }
-    out.push(Piece::new(text, style));
-}
+pub use super::shell_highlight::{detect_shell_language, highlight_shell_line};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -445,6 +292,18 @@ impl Highlighter {
             };
             return Some((end, style));
         }
+        // Rust 生命周期（`'a`、`'static`）与字符字面量（`'x'`）精细着色
+        if c == '\'' && lang.is_some_and(|l| !l.single_quote_strings) {
+            if line.char(i + 1) == Some('\\') && line.char(i + 3) == Some('\'') {
+                return Some((i + 4, theme::code_string()));
+            }
+            if line.char(i + 2) == Some('\'') {
+                return Some((i + 3, theme::code_string()));
+            }
+            if line.char(i + 1).is_some_and(is_word) {
+                return Some((line.word_end(i + 1), theme::code_parameter()));
+            }
+        }
         if c.is_ascii_digit() && !prev.is_some_and(is_word) {
             let end = (i..line.chars.len())
                 .find(|&j| {
@@ -505,6 +364,8 @@ impl Highlighter {
             theme::code_constant()
         } else if next == Some('(') {
             theme::code_function()
+        } else if line.char(i.saturating_sub(1)) == Some('.') && i > 0 {
+            theme::code_property()
         } else if lang.is_some_and(|l| l.capital_types) && capitalized(word) {
             theme::code_type()
         } else {

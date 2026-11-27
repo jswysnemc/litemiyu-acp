@@ -3,9 +3,12 @@
 //! 粗体/斜体/删除线/行内代码、数学公式、裸链接与优雅短链接展示。
 
 pub mod code;
+pub mod diff_block;
 pub mod dollars;
 pub mod inline;
 pub mod mermaid;
+pub mod path_style;
+pub mod shell_highlight;
 pub mod table;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -119,7 +122,16 @@ impl Renderer {
                 Some((_, body)) => body.push_str(&text),
                 None => self.text(&text),
             },
-            Event::Code(text) => self.push(&text, theme::md_code()),
+            Event::Code(text) => {
+                // 若反引号内为明确的文件路径，执行分层路径着色并保留点击打开能力
+                if self.link_starts.is_empty() && path_style::looks_like_file_path(&text) {
+                    let (target, _) = path_style::strip_line_suffix(&text);
+                    self.pieces
+                        .extend(path_style::style_path_pieces(&text, Some(target)));
+                } else {
+                    self.push(&text, theme::md_code());
+                }
+            }
             Event::SoftBreak => {
                 if self.table.is_some() {
                     self.push(" ", Style::new());
@@ -337,11 +349,20 @@ impl Renderer {
         }
         let style = self.current_style();
         let mut at = 0;
-        for (start, end) in bare_urls(text) {
+        for (start, end, kind) in path_style::find_urls_and_paths(text) {
             self.push(&text[at..start], Style::new());
-            let url = &text[start..end];
-            self.pieces
-                .push(Piece::linked(url, style.patch(theme::md_url()), url));
+            let seg = &text[start..end];
+            match kind {
+                path_style::SpanKind::Url => {
+                    self.pieces
+                        .push(Piece::linked(seg, style.patch(theme::md_url()), seg));
+                }
+                path_style::SpanKind::Path => {
+                    let (target, _) = path_style::strip_line_suffix(seg);
+                    self.pieces
+                        .extend(path_style::style_path_pieces(seg, Some(target)));
+                }
+            }
             at = end;
         }
         self.push(&text[at..], Style::new());
@@ -402,7 +423,7 @@ impl Renderer {
                 spans.push(Span::raw(" ".repeat(left_inset)));
             }
             spans.push(Span::styled(" ".repeat(inner_pad_left), bg_style));
-            spans.push(Span::styled(tag, theme::faint().bg(code_bg)));
+            spans.push(Span::styled(tag, theme::dim().bg(code_bg)));
             if pad > 0 {
                 spans.push(Span::styled(" ".repeat(pad), bg_style));
             }
@@ -459,28 +480,42 @@ impl Renderer {
             return;
         }
 
+        let is_shell_block = matches!(
+            lang_trimmed.to_ascii_lowercase().as_str(),
+            "sh" | "bash" | "zsh" | "shell" | "powershell" | "pwsh" | "ps1" | "cmd" | "bat"
+        );
+        let is_diff_block = diff_block::is_diff_lang(lang_trimmed);
+        let mut diff_hl = is_diff_block.then(diff_block::DiffBlockHighlighter::new);
         let mut hl = code::Highlighter::new(code::find_language(lang_trimmed));
         for raw_line in body.trim_end_matches('\n').split('\n') {
-            let pieces = hl.line(raw_line);
+            let (pieces, row_bg_override) = if let Some(dhl) = &mut diff_hl {
+                dhl.line(raw_line)
+            } else if is_shell_block {
+                (shell_highlight::highlight_shell_line(raw_line, Some(lang_trimmed)), None)
+            } else {
+                (hl.line(raw_line), None)
+            };
             let pieces = if pieces.is_empty() {
                 vec![Piece::new("", theme::text())]
             } else {
                 pieces
             };
+            let line_bg = row_bg_override.unwrap_or(code_bg);
+            let line_bg_style = Style::new().bg(line_bg);
             for folded_line in fold(&pieces, code_w as u16) {
                 let mut used_w = 0usize;
                 let mut spans = Vec::with_capacity(folded_line.spans.len() + 3);
                 if left_inset > 0 {
                     spans.push(Span::raw(" ".repeat(left_inset)));
                 }
-                spans.push(Span::styled(" ".repeat(inner_pad_left), bg_style));
+                spans.push(Span::styled(" ".repeat(inner_pad_left), line_bg_style));
                 for span in folded_line.spans {
                     used_w += span.content.width();
-                    spans.push(Span::styled(span.content, span.style.bg(code_bg)));
+                    spans.push(Span::styled(span.content, span.style.bg(line_bg)));
                 }
                 let pad = card_w.saturating_sub(inner_pad_left + used_w);
                 if pad > 0 {
-                    spans.push(Span::styled(" ".repeat(pad), bg_style));
+                    spans.push(Span::styled(" ".repeat(pad), line_bg_style));
                 }
                 let lead = self.lead(is_first_row);
                 let lead_w: usize = lead.iter().map(|s| s.content.width()).sum();
@@ -573,53 +608,6 @@ impl Renderer {
         }
         self.out
     }
-}
-
-fn bare_urls(text: &str) -> Vec<(usize, usize)> {
-    const SCHEMES: [&str; 3] = ["https://", "http://", "file://"];
-    const TAIL: &str = ".,;:!?'\"。，；：！？、";
-    let mut found = Vec::new();
-    let mut from = 0;
-    while let Some((start, scheme)) = SCHEMES
-        .iter()
-        .filter_map(|s| text[from..].find(s).map(|i| (from + i, *s)))
-        .min_by_key(|(i, _)| *i)
-    {
-        let glued = text[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_ascii_alphanumeric());
-        let body = text[start..]
-            .find(|c: char| {
-                !(c.is_ascii_graphic()
-                    && !matches!(c, '<' | '>' | '"' | '`' | '{' | '}' | '|' | '\\' | '^'))
-            })
-            .map_or(text.len(), |i| start + i);
-        let raw = &text[start..body];
-        let mut end_rel = raw.len();
-        while let Some(last) = raw[..end_rel].chars().next_back() {
-            let opener = match last {
-                ')' => Some('('),
-                ']' => Some('['),
-                _ => None,
-            };
-            if let Some(open) = opener {
-                let slice = &raw[..end_rel];
-                if slice.matches(last).count() <= slice.matches(open).count() {
-                    break;
-                }
-            } else if !TAIL.contains(last) {
-                break;
-            }
-            end_rel -= last.len_utf8();
-        }
-        let end = start + end_rel;
-        if !glued && end > start + scheme.len() {
-            found.push((start, end));
-        }
-        from = body.max(start + scheme.len());
-    }
-    found
 }
 
 #[cfg(test)]
