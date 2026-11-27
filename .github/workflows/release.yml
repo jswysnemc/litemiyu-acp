@@ -36,27 +36,27 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset: litemiyu-acp-windows-x86_64
+            asset: agy-tui-windows-x86_64
             ext: .exe
             archive: zip
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset: litemiyu-acp-linux-x86_64
+            asset: agy-tui-linux-x86_64
             ext: ""
             archive: tar.gz
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            asset: litemiyu-acp-linux-aarch64
+            asset: agy-tui-linux-aarch64
             ext: ""
             archive: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset: litemiyu-acp-macos-arm64
+            asset: agy-tui-macos-arm64
             ext: ""
             archive: tar.gz
           - os: macos-latest
             target: x86_64-apple-darwin
-            asset: litemiyu-acp-macos-x86_64
+            asset: agy-tui-macos-x86_64
             ext: ""
             archive: tar.gz
     steps:
@@ -88,13 +88,13 @@ jobs:
           set -euo pipefail
           stage="dist/${{ matrix.asset }}"
           mkdir -p "$stage"
-          cp "target/${{ matrix.target }}/release/litemiyu-acp${{ matrix.ext }}" "$stage/litemiyu-acp${{ matrix.ext }}"
+          cp "target/${{ matrix.target }}/release/agy-tui${{ matrix.ext }}" "$stage/agy-tui${{ matrix.ext }}"
           cp README.md LICENSE "$stage/"
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
             pwsh -NoProfile -Command "Compress-Archive -Path '$stage/*' -DestinationPath 'dist/${{ matrix.asset }}.zip' -Force"
             out_file="${{ matrix.asset }}.zip"
           else
-            chmod +x "$stage/litemiyu-acp"
+            chmod +x "$stage/agy-tui"
             tar -C "$stage" -czf "dist/${{ matrix.asset }}.tar.gz" .
             out_file="${{ matrix.asset }}.tar.gz"
           fi
@@ -131,7 +131,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-          pattern: litemiyu-acp-*
+          pattern: agy-tui-*
 
       - name: Generate combined SHA256SUMS.txt
         shell: bash
@@ -154,7 +154,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
-          name: litemiyu-acp ${{ steps.tag.outputs.name }}
+          name: agy-tui ${{ steps.tag.outputs.name }}
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(steps.tag.outputs.name, '-') }}

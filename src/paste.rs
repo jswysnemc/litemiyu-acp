@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn conpty_crlf_with_ctrl_enter_and_shift_modifiers_submits_once() {
-        let text = " $ Get-Command litemiyu*\r\n\r\n第二段\t缩进\r\n第三段\r\n";
+        let text = " $ Get-Command agy-tui*\r\n\r\n第二段\t缩进\r\n第三段\r\n";
         assert_eq!(
             replay_conpty_into_editor(text, KeyCode::Enter, true),
             vec![text.replace("\r\n", "\n").trim().to_string()]

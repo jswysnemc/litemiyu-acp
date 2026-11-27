@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn prunes_clip_cache_to_max_keep_and_preserves_other_files() {
         let dir = std::env::temp_dir().join(format!(
-            "litemiyu_clip_prune_test_{}",
+            "agy_tui_clip_prune_test_{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);

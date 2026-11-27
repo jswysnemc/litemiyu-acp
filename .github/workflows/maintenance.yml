@@ -34,4 +34,4 @@ jobs:
         run: |
           cargo test
           cargo build --release
-          ./target/release/litemiyu-acp --version
+          ./target/release/agy-tui --version

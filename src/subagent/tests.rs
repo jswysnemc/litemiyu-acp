@@ -14,7 +14,7 @@ impl Logs {
     /// 创建当前测试专用的空日志根目录并返回清理守卫。
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "litemiyu-agents-{}-{}",
+            "agy-tui-agents-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));

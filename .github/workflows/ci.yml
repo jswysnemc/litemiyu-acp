@@ -28,13 +28,13 @@ jobs:
         include:
           - name: Linux (x86_64)
             os: ubuntu-latest
-            bin: target/release/litemiyu-acp
+            bin: target/release/agy-tui
           - name: Windows (x86_64)
             os: windows-latest
-            bin: target/release/litemiyu-acp.exe
+            bin: target/release/agy-tui.exe
           - name: macOS (arm64)
             os: macos-latest
-            bin: target/release/litemiyu-acp
+            bin: target/release/agy-tui
     steps:
       - name: Checkout
         uses: actions/checkout@v4

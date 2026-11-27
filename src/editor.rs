@@ -88,7 +88,7 @@ fn temporary_buffer_path() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    std::env::temp_dir().join(format!("litemiyu-acp-edit-{pid}-{nanos}.md"))
+    std::env::temp_dir().join(format!("agy-tui-edit-{pid}-{nanos}.md"))
 }
 
 /// 规范化外部编辑器写回的内容：去除 UTF-8 BOM、统一换行为 `\n`，并去掉单个末尾换行。
@@ -118,7 +118,7 @@ fn build_editor_command(editor: &str, path: &Path) -> Command {
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg(format!("{editor} \"$1\""))
-            .arg("litemiyu-editor")
+            .arg("agy-tui-editor")
             .arg(path);
         cmd
     }

@@ -1,5 +1,5 @@
-//! litemiyu-acp：参考 LiteMiyu 美学与渲染引擎打造的超轻量 ACP v1 终端客户端。
-//! 默认直连 `agy acp`，亦可通过 `--cmd` 对接任意标准 ACP v1 Server。
+//! agy-tui：面向 Antigravity CLI (`agy`) 打造的超轻量终端 TUI 前端，附带兼容标准 ACP v1 后端。
+//! 默认直连 `agy acp`，亦可通过 `--cmd` 对接其他支持 ACP v1 的 Agent Server。
 
 mod acp;
 mod app;
@@ -18,6 +18,7 @@ mod paste;
 mod paths;
 mod subagent;
 mod theme;
+mod todo;
 mod transcript;
 mod ui;
 
@@ -45,13 +46,12 @@ use tokio::sync::mpsc;
 
 use crate::acp::{AcpClient, AcpEvent};
 use crate::app::{App, UserPrefs};
-use crate::theme::ThemePreset;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "litemiyu-acp",
+    name = "agy-tui",
     version,
-    about = "LiteMiyu 风格的高颜值 ACP v1 终端前端（默认连接 agy acp）"
+    about = "面向 Antigravity CLI (agy) 的高颜值轻量终端前端（附带兼容其他 ACP v1 后端）"
 )]
 struct Cli {
     /// ACP 后端命令（默认："agy acp"；支持附带参数如 "agy acp --sandbox"）
@@ -66,7 +66,7 @@ struct Cli {
     #[arg(short, long)]
     resume: Option<String>,
 
-    /// 指定主题（miyu-lavender / miyu-night / miyu-forest / miyu-day / miyu-paper / terminal）
+    /// 指定内置或自定义主题 ID（如 catppuccin-mocha / rose-pine / kanagawa-wave / nord / miyu-paper / terminal）
     #[arg(long)]
     theme: Option<String>,
 
@@ -88,18 +88,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let prefs = UserPrefs::load();
 
-    let preset = cli
-        .theme
-        .as_deref()
-        .and_then(ThemePreset::parse)
-        .or_else(|| ThemePreset::parse(&prefs.theme))
-        .unwrap_or(ThemePreset::MiyuLavender);
-    let paint_bg = if cli.transparent || preset == ThemePreset::Terminal {
-        false
-    } else {
-        prefs.paint_bg
-    };
-    theme::init(preset, paint_bg);
+    let requested_theme = cli.theme.as_deref().unwrap_or(&prefs.theme);
+    let paint_bg = if cli.transparent { false } else { prefs.paint_bg };
+    theme::init_by_id(requested_theme, paint_bg);
 
     let cwd = cli
         .cwd

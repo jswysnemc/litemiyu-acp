@@ -113,7 +113,7 @@ impl AcpClient {
                         }
                     },
                     "clientInfo": {
-                        "name": "litemiyu-acp",
+                        "name": "agy-tui",
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 }

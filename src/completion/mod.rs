@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn scans_skills_and_fuzzy_matches_workspace_files() {
         let root = std::env::temp_dir().join(format!(
-            "litemiyu_completion_test_{}",
+            "agy_tui_completion_test_{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
