@@ -8,6 +8,9 @@ mod palette;
 mod presets;
 
 use std::path::PathBuf;
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(not(test))]
 use std::sync::{LazyLock, PoisonError, RwLock};
 
 use ratatui::style::{Color, Modifier, Style};
@@ -41,15 +44,49 @@ struct ThemeState {
     revision: u64,
 }
 
-static THEME: LazyLock<RwLock<ThemeState>> = LazyLock::new(|| {
-    RwLock::new(ThemeState {
-        source: ActiveSource::Builtin(ThemePreset::MiyuLavender),
-        paint_bg: true,
-        palette: NIGHT,
-        custom_themes: Vec::new(),
-        revision: 1,
-    })
-});
+impl ThemeState {
+    fn new_default() -> Self {
+        Self {
+            source: ActiveSource::Builtin(ThemePreset::MiyuLavender),
+            paint_bg: true,
+            palette: NIGHT,
+            custom_themes: Vec::new(),
+            revision: 1,
+        }
+    }
+}
+
+#[cfg(not(test))]
+static THEME: LazyLock<RwLock<ThemeState>> = LazyLock::new(|| RwLock::new(ThemeState::new_default()));
+
+#[cfg(test)]
+thread_local! {
+    static TEST_THEME: RefCell<ThemeState> = RefCell::new(ThemeState::new_default());
+}
+
+fn with_theme_read<R>(f: impl FnOnce(&ThemeState) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        let state = THEME.read().unwrap_or_else(PoisonError::into_inner);
+        f(&state)
+    }
+    #[cfg(test)]
+    {
+        TEST_THEME.with(|cell| f(&cell.borrow()))
+    }
+}
+
+fn with_theme_write<R>(f: impl FnOnce(&mut ThemeState) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        let mut state = THEME.write().unwrap_or_else(PoisonError::into_inner);
+        f(&mut state)
+    }
+    #[cfg(test)]
+    {
+        TEST_THEME.with(|cell| f(&mut cell.borrow_mut()))
+    }
+}
 
 /// 按内置预设与铺底标志初始化全局主题（供单元测试快速设定主题状态）。
 ///
@@ -58,12 +95,13 @@ static THEME: LazyLock<RwLock<ThemeState>> = LazyLock::new(|| {
 /// - `paint_bg`: 是否绘制实体背景色
 #[cfg(test)]
 pub fn init(preset: ThemePreset, paint_bg: bool) {
-    let mut state = THEME.write().unwrap_or_else(PoisonError::into_inner);
-    let effective_bg = paint_bg && preset != ThemePreset::Terminal;
-    state.source = ActiveSource::Builtin(preset);
-    state.paint_bg = effective_bg;
-    state.palette = build_preset_palette(preset, effective_bg);
-    state.revision = state.revision.wrapping_add(1);
+    with_theme_write(|state| {
+        let effective_bg = paint_bg && preset != ThemePreset::Terminal;
+        state.source = ActiveSource::Builtin(preset);
+        state.paint_bg = effective_bg;
+        state.palette = build_preset_palette(preset, effective_bg);
+        state.revision = state.revision.wrapping_add(1);
+    });
 }
 
 /// 加载用户自定义主题目录并按主题 ID（支持内置 ID/别名与自定义 ID）初始化主题。
@@ -78,16 +116,17 @@ pub fn init_by_id(theme_id: &str, paint_bg: bool) -> bool {
     let custom = crate::paths::themes_dir()
         .map(|dir| load_custom_themes_from_dir(&dir))
         .unwrap_or_default();
-    let mut state = THEME.write().unwrap_or_else(PoisonError::into_inner);
-    state.custom_themes = custom;
-    if apply_source_by_id(&mut state, theme_id, Some(paint_bg)).is_some() {
-        return true;
-    }
-    state.source = ActiveSource::Builtin(ThemePreset::MiyuLavender);
-    state.paint_bg = paint_bg;
-    state.palette = build_preset_palette(ThemePreset::MiyuLavender, paint_bg);
-    state.revision = state.revision.wrapping_add(1);
-    false
+    with_theme_write(|state| {
+        state.custom_themes = custom;
+        if apply_source_by_id(state, theme_id, Some(paint_bg)).is_some() {
+            return true;
+        }
+        state.source = ActiveSource::Builtin(ThemePreset::MiyuLavender);
+        state.paint_bg = paint_bg;
+        state.palette = build_preset_palette(ThemePreset::MiyuLavender, paint_bg);
+        state.revision = state.revision.wrapping_add(1);
+        false
+    })
 }
 
 /// 重新扫描用户自定义主题目录；若当前正使用自定义主题则立即热更新其调色板。
@@ -99,9 +138,10 @@ pub fn reload_custom_themes() -> usize {
         .map(|dir| load_custom_themes_from_dir(&dir))
         .unwrap_or_default();
     let count = custom.len();
-    let mut state = THEME.write().unwrap_or_else(PoisonError::into_inner);
-    state.custom_themes = custom;
-    rebuild_active_palette(&mut state);
+    with_theme_write(|state| {
+        state.custom_themes = custom;
+        rebuild_active_palette(state);
+    });
     count
 }
 
@@ -113,8 +153,7 @@ pub fn reload_custom_themes() -> usize {
 /// 返回:
 /// - 切换成功返回新主题的展示标签，未找到返回 `None`
 pub fn set_by_id(id: &str) -> Option<String> {
-    let mut state = THEME.write().unwrap_or_else(PoisonError::into_inner);
-    apply_source_by_id(&mut state, id, None)
+    with_theme_write(|state| apply_source_by_id(state, id, None))
 }
 
 /// 预览指定主题而不持久化（供 `/theme` 选择器上下切换即时预览）。
@@ -126,8 +165,7 @@ pub fn set_by_id(id: &str) -> Option<String> {
 /// 返回:
 /// - 是否成功切换预览
 pub fn preview_by_id(id: &str, base_paint_bg: bool) -> bool {
-    let mut state = THEME.write().unwrap_or_else(PoisonError::into_inner);
-    apply_source_by_id(&mut state, id, Some(base_paint_bg)).is_some()
+    with_theme_write(|state| apply_source_by_id(state, id, Some(base_paint_bg)).is_some())
 }
 
 /// 取消预览时精确还原原主题与铺底开关。
@@ -136,12 +174,13 @@ pub fn preview_by_id(id: &str, base_paint_bg: bool) -> bool {
 /// - `id`: 原始主题 ID
 /// - `paint_bg`: 原始铺底开关
 pub fn restore_state(id: &str, paint_bg: bool) {
-    let mut state = THEME.write().unwrap_or_else(PoisonError::into_inner);
-    if apply_source_by_id(&mut state, id, Some(paint_bg)).is_none() {
-        state.source = ActiveSource::Builtin(ThemePreset::MiyuLavender);
-        state.paint_bg = paint_bg;
-        rebuild_active_palette(&mut state);
-    }
+    with_theme_write(|state| {
+        if apply_source_by_id(state, id, Some(paint_bg)).is_none() {
+            state.source = ActiveSource::Builtin(ThemePreset::MiyuLavender);
+            state.paint_bg = paint_bg;
+            rebuild_active_palette(state);
+        }
+    });
 }
 
 /// 切换当前主题的铺底色 / 透明背景状态。
@@ -149,10 +188,11 @@ pub fn restore_state(id: &str, paint_bg: bool) {
 /// 返回:
 /// - 切换后的 `paint_bg` 状态（`true` 表示铺底色，`false` 表示透明继承终端）
 pub fn toggle_bg() -> bool {
-    let mut state = THEME.write().unwrap_or_else(PoisonError::into_inner);
-    state.paint_bg = !state.paint_bg;
-    rebuild_active_palette(&mut state);
-    state.paint_bg
+    with_theme_write(|state| {
+        state.paint_bg = !state.paint_bg;
+        rebuild_active_palette(state);
+        state.paint_bg
+    })
 }
 
 /// 将当前激活主题导出为可编辑 JSON 模板文件。
@@ -164,32 +204,28 @@ pub fn toggle_bg() -> bool {
 /// - 成功返回写入路径并自动重载自定义主题列表，失败返回错误信息
 pub fn export_current_theme(raw_name: &str) -> Result<PathBuf, String> {
     let dir = crate::paths::themes_dir().ok_or_else(|| "无法解析用户配置目录".to_string())?;
-    let (base_id, base_palette, transparent) = {
-        let state = THEME.read().unwrap_or_else(PoisonError::into_inner);
-        let (base_id, base_palette, transparent) = match &state.source {
-            ActiveSource::Builtin(p) => (
-                p.id().to_string(),
-                p.base_palette(),
-                !state.paint_bg || *p == ThemePreset::Terminal,
-            ),
-            ActiveSource::Custom(cid) => {
-                if let Some(ct) = state.custom_themes.iter().find(|t| t.id == *cid) {
-                    (
-                        ct.base_preset.id().to_string(),
-                        ct.palette,
-                        !state.paint_bg || ct.transparent,
-                    )
-                } else {
-                    (
-                        ThemePreset::MiyuLavender.id().to_string(),
-                        state.palette,
-                        !state.paint_bg,
-                    )
-                }
+    let (base_id, base_palette, transparent) = with_theme_read(|state| match &state.source {
+        ActiveSource::Builtin(p) => (
+            p.id().to_string(),
+            p.base_palette(),
+            !state.paint_bg || *p == ThemePreset::Terminal,
+        ),
+        ActiveSource::Custom(cid) => {
+            if let Some(ct) = state.custom_themes.iter().find(|t| t.id == *cid) {
+                (
+                    ct.base_preset.id().to_string(),
+                    ct.palette,
+                    !state.paint_bg || ct.transparent,
+                )
+            } else {
+                (
+                    ThemePreset::MiyuLavender.id().to_string(),
+                    state.palette,
+                    !state.paint_bg,
+                )
             }
-        };
-        (base_id, base_palette, transparent)
-    };
+        }
+    });
     let saved = export_theme_template(&dir, raw_name, &base_id, &base_palette, transparent)?;
     let _ = reload_custom_themes();
     Ok(saved)
@@ -197,28 +233,29 @@ pub fn export_current_theme(raw_name: &str) -> Result<PathBuf, String> {
 
 /// 返回全部可选主题列表（全部内置预设 + 已加载的用户自定义主题）。
 pub fn list_themes() -> Vec<ThemeDescriptor> {
-    let state = THEME.read().unwrap_or_else(PoisonError::into_inner);
-    let mut list = Vec::with_capacity(ThemePreset::ALL.len() + state.custom_themes.len());
-    for &preset in ThemePreset::ALL {
-        list.push(ThemeDescriptor {
-            id: preset.id().to_string(),
-            label: preset.label().to_string(),
-            detail: format!("{} · {}", preset.category_tag(), preset.id()),
-        });
-    }
-    for custom in &state.custom_themes {
-        let mode_tag = if custom.transparent {
-            "自定义·透明"
-        } else {
-            "自定义"
-        };
-        list.push(ThemeDescriptor {
-            id: custom.id.clone(),
-            label: custom.label.clone(),
-            detail: format!("{mode_tag} · {}", custom.id),
-        });
-    }
-    list
+    with_theme_read(|state| {
+        let mut list = Vec::with_capacity(ThemePreset::ALL.len() + state.custom_themes.len());
+        for &preset in ThemePreset::ALL {
+            list.push(ThemeDescriptor {
+                id: preset.id().to_string(),
+                label: preset.label().to_string(),
+                detail: format!("{} · {}", preset.category_tag(), preset.id()),
+            });
+        }
+        for custom in &state.custom_themes {
+            let mode_tag = if custom.transparent {
+                "自定义·透明"
+            } else {
+                "自定义"
+            };
+            list.push(ThemeDescriptor {
+                id: custom.id.clone(),
+                label: custom.label.clone(),
+                detail: format!("{mode_tag} · {}", custom.id),
+            });
+        }
+        list
+    })
 }
 
 /// 按主题 ID 查询用于选择器展示的 5 色代表色板。
@@ -232,19 +269,19 @@ pub fn swatches_for_id(id: &str) -> Option<[Color; 5]> {
     if let Some(preset) = ThemePreset::parse(id) {
         return Some(swatch_colors(&preset.base_palette()));
     }
-    let state = THEME.read().unwrap_or_else(PoisonError::into_inner);
-    state
-        .custom_themes
-        .iter()
-        .find(|t| t.id.eq_ignore_ascii_case(id))
-        .map(|t| swatch_colors(&t.palette))
+    with_theme_read(|state| {
+        state
+            .custom_themes
+            .iter()
+            .find(|t| t.id.eq_ignore_ascii_case(id))
+            .map(|t| swatch_colors(&t.palette))
+    })
 }
 
 /// 返回当前激活主题对应的内置预设（自定义主题时返回其基底预设）。
 #[allow(dead_code)]
 pub fn current_preset() -> ThemePreset {
-    let state = THEME.read().unwrap_or_else(PoisonError::into_inner);
-    match &state.source {
+    with_theme_read(|state| match &state.source {
         ActiveSource::Builtin(p) => *p,
         ActiveSource::Custom(cid) => state
             .custom_themes
@@ -252,23 +289,21 @@ pub fn current_preset() -> ThemePreset {
             .find(|t| t.id == *cid)
             .map(|t| t.base_preset)
             .unwrap_or(ThemePreset::MiyuLavender),
-    }
+    })
 }
 
 /// 返回当前激活主题的稳定 ID（用于持久化与首页展示）。
 pub fn current_theme_id() -> String {
-    let state = THEME.read().unwrap_or_else(PoisonError::into_inner);
-    match &state.source {
+    with_theme_read(|state| match &state.source {
         ActiveSource::Builtin(p) => p.id().to_string(),
         ActiveSource::Custom(cid) => cid.clone(),
-    }
+    })
 }
 
 /// 返回当前激活主题的展示名称。
 #[allow(dead_code)]
 pub fn current_theme_label() -> String {
-    let state = THEME.read().unwrap_or_else(PoisonError::into_inner);
-    match &state.source {
+    with_theme_read(|state| match &state.source {
         ActiveSource::Builtin(p) => p.label().to_string(),
         ActiveSource::Custom(cid) => state
             .custom_themes
@@ -276,22 +311,22 @@ pub fn current_theme_label() -> String {
             .find(|t| t.id == *cid)
             .map(|t| t.label.clone())
             .unwrap_or_else(|| cid.clone()),
-    }
+    })
 }
 
 /// 返回当前是否开启实体背景铺底。
 pub fn paint_bg() -> bool {
-    THEME.read().unwrap_or_else(PoisonError::into_inner).paint_bg
+    with_theme_read(|state| state.paint_bg)
 }
 
 /// 返回当前主题单调递增修订号（每次切换主题、开关透明或重载配置均递增）。
 pub fn revision() -> u64 {
-    THEME.read().unwrap_or_else(PoisonError::into_inner).revision
+    with_theme_read(|state| state.revision)
 }
 
 /// 返回当前生效的完整调色板快照。
 pub fn palette() -> Palette {
-    THEME.read().unwrap_or_else(PoisonError::into_inner).palette
+    with_theme_read(|state| state.palette)
 }
 
 fn build_preset_palette(preset: ThemePreset, paint_bg: bool) -> Palette {
