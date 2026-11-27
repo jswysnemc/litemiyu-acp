@@ -1,6 +1,6 @@
 [package]
 name = "agy-tui"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Lightweight high-aesthetics TUI frontend for Antigravity CLI (agy), with compatible ACP v1 backend support"
 license = "AGPL-3.0-or-later"
